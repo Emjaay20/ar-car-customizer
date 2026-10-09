@@ -1,0 +1,84 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             String              @id @default(uuid()) @db.Uuid
+  email          String              @unique
+  passwordHash   String
+  fullName       String
+  createdAt      DateTime            @default(now())
+  configurations UserConfiguration[]
+}
+
+model CarModel {
+  id             String              @id @default(uuid()) @db.Uuid
+  make           String
+  model          String
+  year           Int
+  baseMeshUrl    String
+  configurations UserConfiguration[]
+  fitments       AssetFitment[]
+}
+
+enum AssetType {
+  PAINT
+  RIM
+  SPOILER
+}
+
+model Asset {
+  id                 String               @id @default(uuid()) @db.Uuid
+  type               AssetType
+  name               String
+  materialBundleUrl  String
+  price              Float
+  anchor             String?
+  configurationLinks ConfigurationAsset[]
+  fits               AssetFitment[]
+}
+
+model AssetFitment {
+  assetId String @db.Uuid
+  carId   String @db.Uuid
+
+  asset Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  car   CarModel @relation(fields: [carId], references: [id], onDelete: Cascade)
+
+  @@id([assetId, carId])
+}
+
+enum ConfigurationStatus {
+  DRAFT
+  QUOTED
+  CONFIRMED
+}
+
+model UserConfiguration {
+  id         String              @id @default(uuid()) @db.Uuid
+  userId     String              @db.Uuid
+  carId      String              @db.Uuid
+  name       String?
+  shareToken String?             @unique
+  status     ConfigurationStatus @default(DRAFT)
+  createdAt  DateTime            @default(now())
+
+  user   User       @relation(fields: [userId], references: [id])
+  car    CarModel   @relation(fields: [carId], references: [id])
+  assets ConfigurationAsset[]
+}
+
+model ConfigurationAsset {
+  configurationId String @db.Uuid
+  assetId         String @db.Uuid
+
+  configuration UserConfiguration @relation(fields: [configurationId], references: [id])
+  asset         Asset             @relation(fields: [assetId], references: [id])
+
+  @@id([configurationId, assetId])
+}

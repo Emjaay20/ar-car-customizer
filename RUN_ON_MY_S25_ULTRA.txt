@@ -1,0 +1,56 @@
+================================================================================
+AR CAR CUSTOMIZER - EASY RUN ON YOUR SAMSUNG S25 ULTRA (ANDROID)
+================================================================================
+
+ONE-TIME PHONE SETUP (do this now):
+1. On your S25 Ultra:
+   - Go to Settings > About phone
+   - Tap "Build number" 7 times until it says "You are now a developer"
+   - Go back to Settings > Developer options
+   - Turn ON "Wireless debugging"
+   - Phone and laptop must be on the same Wi-Fi
+
+2. Double-click run-on-phone.bat
+   - First time, type Y when it asks to pair
+   - On the phone, tap "Pair device with pairing code"
+   - Type that IP:port and the 6-digit code into the window
+   - Then type the IP:port from the main Wireless debugging screen
+     (that port is not the pairing port)
+
+A USB cable is not required. The script remembers the last wireless address.
+
+================================================================================
+HOW TO RUN EVERY TIME (SUPER EASY)
+================================================================================
+
+STEP 1: Start the Backend (database + server)
+- Double-click the file: start-backend.bat
+- A black window will open. Leave it running.
+- Wait until you see "🚀 Backend running on http://0.0.0.0:3000/graphql" or similar.
+
+STEP 2: Run on your S25 Ultra
+- Double-click the file: run-on-phone.bat
+- It will automatically use IP 192.168.100.66
+- Your phone should be detected.
+- The app will install and launch on your S25 Ultra.
+
+If phone not detected:
+- Reopen Wireless debugging on the phone and run run-on-phone.bat again
+- The connect port changes when that screen is reopened
+- Accept the "Allow wireless debugging?" prompt on the phone
+
+================================================================================
+IMPORTANT
+================================================================================
+- Both .bat files must be run from the main folder (ar-car-customizer)
+- Keep the backend window open while using the app
+- The app reads API_URL from --dart-define. run-on-phone.bat passes 192.168.100.66
+- Login is real. After seed, use demo@arcar.com / demo-password
+- Unity script changes are NOT on the phone until you re-export from Unity
+- The 3D model is a stand-in milk truck hosted by the backend, not the catalog car
+- First run may take 1-2 minutes to install
+
+If you get errors, tell me exactly what it says.
+
+You are ready to test AR car customization on your S25 Ultra!
+================================================================================

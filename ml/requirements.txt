@@ -1,0 +1,4 @@
+# Optional. --synthetic and --self-test use only the Python standard library.
+# Real photos and video also need these:
+ultralytics>=8.3
+opencv-python>=4.8

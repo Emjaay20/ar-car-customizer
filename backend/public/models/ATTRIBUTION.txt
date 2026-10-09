@@ -1,0 +1,10 @@
+Cesium Milk Truck
+Source: Khronos glTF Sample Models
+https://github.com/KhronosGroup/glTF-Sample-Models/tree/master/2.0/CesiumMilkTruck
+
+Donated by Cesium for glTF testing. This file is a stand-in preview mesh
+hosted by this backend so the AR viewer can load a model we actually serve.
+It is not a Toyota, Honda, or Hyundai, and it is not a production car asset.
+
+See the Cesium trademark policy before using the Cesium name in a product:
+https://github.com/CesiumGS/cesium/blob/main/LICENSE.md

@@ -1,0 +1,111 @@
+# ------------------------------------------------------
+# THIS FILE WAS AUTOMATICALLY GENERATED (DO NOT MODIFY)
+# ------------------------------------------------------
+
+type AuthUserModel {
+  id: ID!
+  email: String!
+  fullName: String!
+}
+
+type AuthPayload {
+  token: String!
+  user: AuthUserModel!
+}
+
+type AssetModel {
+  id: ID!
+  type: String!
+  name: String!
+  materialBundleUrl: String!
+  price: Float!
+  anchor: String
+}
+
+type CarModel {
+  id: ID!
+  make: String!
+  model: String!
+  year: Int!
+  baseMeshUrl: String!
+}
+
+type SharedConfigurationModel {
+  id: ID!
+  name: String
+  status: String!
+  createdAt: DateTime!
+  car: CarModel
+  assets: [AssetModel!]!
+}
+
+"""
+A date-time string at UTC, such as 2019-12-03T09:54:33Z, compliant with the date-time format.
+"""
+scalar DateTime
+
+type UserConfigurationModel {
+  id: ID!
+  userId: ID!
+  carId: ID!
+  name: String
+  shareToken: String
+  status: String!
+  createdAt: DateTime!
+  car: CarModel
+  assets: [AssetModel!]!
+}
+
+type VehicleIdentificationModel {
+  identified: Boolean!
+  source: String!
+  make: String
+  model: String
+  year: Int
+  confidence: Float
+  yearExact: Boolean!
+  reason: String
+  carId: ID
+  car: CarModel
+  assets: [AssetModel!]!
+}
+
+type Query {
+  cars: [CarModel!]!
+  car(id: ID!): CarModel
+  assets(type: String): [AssetModel!]!
+  assetsForCar(carId: ID!, type: String): [AssetModel!]!
+  sharedConfiguration(token: String!): SharedConfigurationModel!
+  myConfigurations: [UserConfigurationModel!]!
+}
+
+type Mutation {
+  login(input: LoginInput!): AuthPayload!
+  register(input: RegisterInput!): AuthPayload!
+  saveConfiguration(input: SaveConfigurationInput!): UserConfigurationModel!
+  shareConfiguration(id: ID!): UserConfigurationModel!
+  identifyVehicle(input: IdentifyVehicleInput!): VehicleIdentificationModel!
+}
+
+input LoginInput {
+  email: String!
+  password: String!
+}
+
+input RegisterInput {
+  email: String!
+  password: String!
+  fullName: String!
+}
+
+input SaveConfigurationInput {
+  carId: ID!
+  assetIds: [ID!]!
+  status: String
+  name: String
+}
+
+input IdentifyVehicleInput {
+  imageBase64: String!
+  mimeType: String
+}

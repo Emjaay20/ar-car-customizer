@@ -1,0 +1,69 @@
+# Unity generated
+My project/Library/
+My project/Temp/
+My project/Obj/
+My project/obj/
+My project/Logs/
+My project/UserSettings/
+My project/MemoryCaptures/
+My project/Build/
+My project/Builds/
+My project/ExportedObj/
+My project/.vs/
+My project/*.csproj
+My project/*.sln
+My project/*.suo
+My project/*.user
+My project/*.userprefs
+My project/*.pidb
+My project/*.booproj
+My project/*.svd
+My project/*.pdb
+My project/*.mdb
+My project/*.opendb
+My project/*.VC.db
+My project/sysinfo.txt
+My project/*.apk
+My project/*.aab
+My project/*.unitypackage
+My project/*.app
+
+# Unity crash / addressables leftovers
+My project/Assets/AssetStoreTools*
+My project/Assets/StreamingAssets/aa*
+
+# Segmentation prototype output
+ml/out/
+backend/public/masks/
+
+# Node
+backend/node_modules/
+backend/dist/
+backend/coverage/
+backend/.env
+backend/*.tsbuildinfo
+
+# Flutter / Dart
+client/.dart_tool/
+client/build/
+client/.flutter-plugins
+client/.flutter-plugins-dependencies
+client/.pub-cache/
+client/.pub/
+client/coverage/
+
+# Exported Unity player projects are rebuild artifacts.
+# Re-export from Unity before a phone build picks up script changes.
+client/android/unityLibrary/
+client/ios/Unity-iPhone/
+
+# Last wireless-debugging address for this laptop. Not a secret, but machine-specific.
+phone-wifi.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+.idea/
+*.iml
