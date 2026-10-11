@@ -6,7 +6,7 @@ class GraphQLService {
   /// Passed at compile time: flutter run --dart-define=API_URL=http://HOST:3000/graphql
   static const String apiUrl = String.fromEnvironment(
     'API_URL',
-    defaultValue: 'http://127.0.0.1:3000/graphql',
+    defaultValue: 'http://192.168.100.66:3000/graphql',
   );
 
   static String resolveUrl(String url, {String? apiUrl}) {

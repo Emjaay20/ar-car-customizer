@@ -185,6 +185,7 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
+    const t0 = Date.now();
     const msg = await this.sendWorkerCommand({
       mode: 'segment',
       imageBase64: base64Payload,
@@ -193,22 +194,32 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
       panel: options?.panel ?? 'body',
       repolishOnly,
     });
+    const elapsedMs = Date.now() - t0;
 
     if (msg.ok && typeof msg.maskBase64 === 'string') {
+      const paintPixels = Number(msg.paintPixels ?? 0);
+      const source = String(msg.source ?? 'yolov8s-seg');
+      console.log(
+        `[VisionService] segmentLiveCar ok=true source=${source} paintPixels=${paintPixels} color=${options?.hexColor ?? '#9B1B30'} finish=${options?.finish ?? 'gloss'} panel=${options?.panel ?? 'body'} repolish=${repolishOnly} (${elapsedMs}ms)`,
+      );
       return {
         masked: true,
         maskBase64: msg.maskBase64,
         polishedBase64: typeof msg.polishedBase64 === 'string' ? msg.polishedBase64 : undefined,
-        paintPixels: Number(msg.paintPixels ?? 0),
-        source: String(msg.source ?? 'yolov8s-seg'),
+        paintPixels,
+        source,
       };
     }
 
+    const failReason = String(msg.reason ?? 'Segmentation failed');
+    console.log(
+      `[VisionService] segmentLiveCar ok=false reason="${failReason}" (${elapsedMs}ms)`,
+    );
     return {
       masked: false,
       paintPixels: 0,
       source: String(msg.source ?? 'error'),
-      reason: String(msg.reason ?? 'Segmentation failed'),
+      reason: failReason,
     };
   }
 
