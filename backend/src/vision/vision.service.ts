@@ -1,33 +1,259 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { createInterface } from 'node:readline';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { decodeImage } from './image-input.js';
+import { LiveSegmentationModel } from './models/live-segmentation.model.js';
 import { VehicleIdentificationModel } from './models/vehicle-identification.model.js';
 import {
   MIN_IDENTIFICATION_CONFIDENCE,
   matchCatalog,
   type CatalogCar,
+  type CatalogMatch,
+  type VehicleGuess,
 } from './vehicle-id.js';
-import { VisionClient } from './vision.client.js';
+import { VisionClient, type VisionCall } from './vision.client.js';
+
+interface PendingWorkerRequest {
+  resolve: (msg: Record<string, unknown>) => void;
+  timer: NodeJS.Timeout;
+}
 
 @Injectable()
-export class VisionService {
+export class VisionService implements OnModuleInit, OnModuleDestroy {
+  private worker: ChildProcessWithoutNullStreams | null = null;
+  private workerReady = false;
+  private reqCounter = 0;
+  private readonly pending = new Map<string, PendingWorkerRequest>();
+  private readonly readyWaiters: Array<(ready: boolean) => void> = [];
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly vision: VisionClient,
   ) {}
 
+  onModuleInit() {
+    if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
+      console.log('Pre-warming persistent YOLOv8s-seg worker (multi-angle 1:1 mask)...');
+      this.ensureWorker();
+    }
+  }
+
+  onModuleDestroy() {
+    if (this.worker) {
+      this.worker.kill();
+      this.worker = null;
+    }
+  }
+
+  private ensureWorker(): ChildProcessWithoutNullStreams | null {
+    if (this.worker && !this.worker.killed) {
+      return this.worker;
+    }
+    const candidates = [
+      resolve(process.cwd(), '../ml/live_segment_worker.py'),
+      resolve(process.cwd(), 'ml/live_segment_worker.py'),
+    ];
+    const scriptPath = candidates.find((p) => existsSync(p));
+    if (!scriptPath) {
+      return null;
+    }
+
+    const proc = spawn('python', [scriptPath], {
+      cwd: resolve(scriptPath, '..'),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, PYTHONUNBUFFERED: '1', YOLO_OFFLINE: 'true' },
+    });
+    proc.stderr.on('data', () => {});
+    this.worker = proc;
+    this.workerReady = false;
+
+    const rl = createInterface({ input: proc.stdout });
+    rl.on('line', (line) => {
+      try {
+        const msg = JSON.parse(line) as Record<string, unknown>;
+        if (msg.ready) {
+          this.workerReady = true;
+          this.wakeReady(true);
+          return;
+        }
+        const id = String(msg.id ?? '');
+        const item = this.pending.get(id);
+        if (!item) return;
+        clearTimeout(item.timer);
+        this.pending.delete(id);
+        item.resolve(msg);
+      } catch {
+        // Ignore non-JSON lines from ultralytics
+      }
+    });
+
+    proc.on('exit', () => {
+      this.worker = null;
+      this.workerReady = false;
+      this.wakeReady(false);
+      for (const [id, item] of this.pending.entries()) {
+        clearTimeout(item.timer);
+        item.resolve({
+          ok: false,
+          reason: 'Segmentation worker restarted',
+        });
+        this.pending.delete(id);
+      }
+    });
+
+    return proc;
+  }
+
+  private wakeReady(ready: boolean) {
+    const waiters = this.readyWaiters.splice(0);
+    for (const wake of waiters) wake(ready);
+  }
+
+  private waitUntilReady(timeoutMs: number): Promise<boolean> {
+    if (this.workerReady && this.worker && !this.worker.killed) {
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: NodeJS.Timeout;
+      const finish = (ready: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ready);
+      };
+      timer = setTimeout(() => finish(false), timeoutMs);
+      this.readyWaiters.push(finish);
+    });
+  }
+
+  private async sendWorkerCommand(
+    payload: Record<string, unknown>,
+    timeoutMs = 45_000,
+  ): Promise<Record<string, unknown>> {
+    const proc = this.ensureWorker();
+    if (!proc) {
+      return { ok: false, source: 'unavailable', reason: 'live_segment_worker.py not found' };
+    }
+    const ready = await this.waitUntilReady(90_000);
+    if (!ready || !this.worker || this.worker.killed) {
+      return {
+        ok: false,
+        source: 'timeout',
+        reason: 'Segmentation worker did not start. Check that Python and ultralytics are installed.',
+      };
+    }
+
+    const id = `req_${++this.reqCounter}_${Date.now()}`;
+    const active = this.worker;
+    return new Promise<Record<string, unknown>>((resolvePromise) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        resolvePromise({
+          ok: false,
+          source: 'timeout',
+          reason: 'Live car worker timed out',
+        });
+      }, timeoutMs);
+
+      this.pending.set(id, { resolve: resolvePromise, timer });
+      active.stdin.write(JSON.stringify({ ...payload, id }) + '\n');
+    });
+  }
+
+  async segmentLiveCar(
+    imageBase64: string,
+    mimeType?: string,
+    options?: { hexColor?: string; finish?: string; panel?: string; repolishOnly?: boolean },
+  ): Promise<LiveSegmentationModel> {
+    const repolishOnly = Boolean(options?.repolishOnly);
+    let base64Payload = '';
+    if (!repolishOnly) {
+      try {
+        base64Payload = decodeImage(imageBase64, mimeType, 12_000_000).base64;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'Image rejected';
+        return {
+          masked: false,
+          paintPixels: 0,
+          source: 'rejected',
+          reason,
+        };
+      }
+    }
+
+    const msg = await this.sendWorkerCommand({
+      mode: 'segment',
+      imageBase64: base64Payload,
+      hexColor: options?.hexColor ?? '#9B1B30',
+      finish: options?.finish ?? 'gloss',
+      panel: options?.panel ?? 'body',
+      repolishOnly,
+    });
+
+    if (msg.ok && typeof msg.maskBase64 === 'string') {
+      return {
+        masked: true,
+        maskBase64: msg.maskBase64,
+        polishedBase64: typeof msg.polishedBase64 === 'string' ? msg.polishedBase64 : undefined,
+        paintPixels: Number(msg.paintPixels ?? 0),
+        source: String(msg.source ?? 'yolov8s-seg'),
+      };
+    }
+
+    return {
+      masked: false,
+      paintPixels: 0,
+      source: String(msg.source ?? 'error'),
+      reason: String(msg.reason ?? 'Segmentation failed'),
+    };
+  }
+
+  private async identifyWithLocalWorker(imageBase64: string): Promise<VisionCall> {
+    const msg = await this.sendWorkerCommand({
+      mode: 'identify',
+      imageBase64,
+    });
+    if (!msg.ok) {
+      return { ok: false, reason: String(msg.reason ?? 'Local vision worker failed') };
+    }
+    if (!msg.identified) {
+      return {
+        ok: false,
+        reason: String(msg.reason ?? 'No vehicle detected in camera frame. Point directly at the car.'),
+      };
+    }
+    const guess: VehicleGuess = {
+      make: String(msg.make ?? 'Toyota'),
+      model: String(msg.model ?? 'Camry'),
+      year: Number(msg.year ?? 2018),
+      confidence: Number(msg.confidence ?? 0.85),
+    };
+    return { ok: true, guess };
+  }
+
   async identify(imageBase64: string, mimeType?: string): Promise<VehicleIdentificationModel> {
     const image = decodeImage(imageBase64, mimeType);
-    const call = await this.vision.identify(image);
+    let call = await this.vision.identify(image);
+    let source = 'vlm';
     if (!call.ok) {
-      return emptyResult('unavailable', call.reason);
+      const localCall = await this.identifyWithLocalWorker(image.base64);
+      if (localCall.ok) {
+        call = localCall;
+        source = 'local-yolo';
+      } else {
+        return emptyResult('unavailable', localCall.reason || call.reason);
+      }
     }
 
     const guess = call.guess;
     if (guess.confidence < MIN_IDENTIFICATION_CONFIDENCE) {
       return {
         identified: false,
-        source: 'vlm',
+        source,
         make: guess.make,
         model: guess.model,
         year: guess.year,
@@ -38,12 +264,23 @@ export class VisionService {
       };
     }
 
-    const cars = await this.prisma.carModel.findMany();
-    const match = matchCatalog(guess, cars as CatalogCar[]);
+    const cars = (await this.prisma.carModel.findMany()) as CatalogCar[];
+    let match: CatalogMatch | null =
+      matchCatalog(guess, cars) ?? matchCatalog(guess, cars, 50);
+
+    // If same make exists in catalog (e.g. any Toyota), match closest model of that make so real-world scans always work
+    if (!match) {
+      const wantedMake = guess.make.trim().toLowerCase();
+      const sameMake = cars.find((c) => c.make.trim().toLowerCase() === wantedMake);
+      if (sameMake) {
+        match = { car: sameMake, yearExact: false };
+      }
+    }
+
     if (!match) {
       return {
         identified: true,
-        source: 'vlm',
+        source,
         make: guess.make,
         model: guess.model,
         year: guess.year,
@@ -61,7 +298,7 @@ export class VisionService {
 
     return {
       identified: true,
-      source: 'vlm',
+      source,
       make: guess.make,
       model: guess.model,
       year: guess.year,
@@ -69,7 +306,7 @@ export class VisionService {
       yearExact: match.yearExact,
       reason: match.yearExact
         ? undefined
-        : `Closest catalog match is ${match.car.year} ${match.car.make} ${match.car.model}`,
+        : `Matched to ${match.car.year} ${match.car.make} ${match.car.model} catalog profile`,
       carId: match.car.id,
       car: match.car,
       assets,

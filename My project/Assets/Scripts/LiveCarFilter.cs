@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.Rendering.Universal;
 
 /// <summary>
 /// Screen-space tint. Invisible until a segmentation mask is supplied.
@@ -20,6 +21,13 @@ public class LiveCarFilter : MonoBehaviour
     {
         if (camera == null) return null;
 
+        var camData = camera.GetComponent<UniversalAdditionalCameraData>();
+        if (camData != null)
+        {
+            camData.requiresColorOption = CameraOverrideOption.On;
+            camData.requiresColorTexture = true;
+        }
+
         var existing = camera.GetComponentInChildren<LiveCarFilter>(true);
         if (existing != null) return existing;
 
@@ -36,10 +44,19 @@ public class LiveCarFilter : MonoBehaviour
         var camera = GetComponentInParent<Camera>();
         if (camera == null) return;
 
-        transform.localPosition = new Vector3(0f, 0f, Distance);
+        // ARCore overrides camera.projectionMatrix directly without updating camera.fieldOfView.
+        // Compute exact quad dimensions and principal-point offset from projectionMatrix so UV [0..1]
+        // maps 1:1 to the camera viewport corners (-1..+1 NDC).
+        var proj = camera.projectionMatrix;
+        float m00 = Mathf.Abs(proj.m00) > 1e-4f ? proj.m00 : (1f / (Mathf.Tan(camera.fieldOfView * 0.5f * Mathf.Deg2Rad) * camera.aspect));
+        float m11 = Mathf.Abs(proj.m11) > 1e-4f ? proj.m11 : (1f / Mathf.Tan(camera.fieldOfView * 0.5f * Mathf.Deg2Rad));
+        float width = (2f * Distance) / Mathf.Abs(m00);
+        float height = (2f * Distance) / Mathf.Abs(m11);
+        float offsetX = (proj.m02 * Distance) / m00;
+        float offsetY = (proj.m12 * Distance) / m11;
+
+        transform.localPosition = new Vector3(offsetX, offsetY, Distance);
         transform.localRotation = Quaternion.identity;
-        var height = 2f * Distance * Mathf.Tan(camera.fieldOfView * 0.5f * Mathf.Deg2Rad);
-        var width = height * camera.aspect;
         transform.localScale = new Vector3(width, height, 1f);
     }
 
@@ -67,6 +84,13 @@ public class LiveCarFilter : MonoBehaviour
         material.SetTexture("_MaskTex", mask != null ? mask : Texture2D.blackTexture);
         ApplyFinish();
         return mask != null;
+    }
+
+    public void SetSceneTexture(Texture sceneTex)
+    {
+        if (!EnsureMaterial()) return;
+        if (sceneTex != null)
+            material.SetTexture("_SceneTex", sceneTex);
     }
 
     void ApplyFinish()

@@ -170,7 +170,12 @@ class _GarageScreenState extends State<GarageScreen> {
                             : () {
                                 Navigator.push(
                                   context,
-                                  MaterialPageRoute(builder: (_) => CustomizationScreen(car: car)),
+                                  MaterialPageRoute(
+                                    builder: (_) => CustomizationScreen(
+                                      car: car,
+                                      initialVehicleLabel: title,
+                                    ),
+                                  ),
                                 );
                               },
                       ),

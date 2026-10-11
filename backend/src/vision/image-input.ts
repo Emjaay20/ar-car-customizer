@@ -10,7 +10,7 @@ export interface DecodedImage {
   byteLength: number;
 }
 
-export function decodeImage(imageBase64: string, mimeType?: string): DecodedImage {
+export function decodeImage(imageBase64: string, mimeType?: string, maxBytes = MAX_BYTES): DecodedImage {
   let raw = imageBase64.trim().replace(/\s/g, '');
   let mime = mimeType?.trim().toLowerCase() || 'image/jpeg';
   const dataUrl = raw.match(/^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i);
@@ -19,15 +19,16 @@ export function decodeImage(imageBase64: string, mimeType?: string): DecodedImag
     raw = dataUrl[2];
   }
 
+  const maxChars = Math.max(MAX_BASE64_CHARS, Math.ceil((maxBytes * 4) / 3) + 64);
   if (!ALLOWED.has(mime)) {
     throw new BadRequestException('Image must be jpeg, png, or webp');
   }
-  if (!raw || raw.length > MAX_BASE64_CHARS) {
+  if (!raw || raw.length > maxChars) {
     throw new BadRequestException('Image is too large');
   }
 
   const bytes = Buffer.from(raw, 'base64');
-  if (bytes.length === 0 || bytes.length > MAX_BYTES) {
+  if (bytes.length === 0 || bytes.length > maxBytes) {
     throw new BadRequestException('Image is too large');
   }
 

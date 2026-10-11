@@ -144,7 +144,7 @@ def segment_bgr(frame_bgr, model, cv2):
         frame_bgr = cv2.resize(frame_bgr, (max_width, int(height * scale)))
         height, width = frame_bgr.shape[:2]
 
-    result = model.predict(frame_bgr, classes=[2, 7], verbose=False)[0]
+    result = model.predict(frame_bgr, classes=[2, 5, 7], conf=0.10, verbose=False)[0]
     if result.masks is None or len(result.masks.data) == 0:
         return None
 

@@ -35,7 +35,7 @@ class GraphQLService {
 
     return GraphQLClient(
       link: authLink.concat(httpLink),
-      cache: GraphQLCache(store: HiveStore()),
+      cache: GraphQLCache(store: InMemoryStore()),
     );
   }
 

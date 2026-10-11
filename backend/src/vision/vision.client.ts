@@ -25,7 +25,7 @@ export class VisionClient {
     }
 
     const url = process.env.VISION_API_URL?.trim() || 'https://api.groq.com/openai/v1/chat/completions';
-    const model = process.env.VISION_MODEL?.trim() || 'llama-3.2-90b-vision-preview';
+    const model = process.env.VISION_MODEL?.trim() || 'meta-llama/llama-4-scout-17b-16e-instruct';
 
     let response: Response;
     try {

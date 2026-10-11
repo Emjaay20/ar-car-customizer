@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -10,16 +11,20 @@ import 'package:share_plus/share_plus.dart';
 import '../models/asset.dart';
 import '../models/car.dart';
 import '../services/auth_session.dart';
-import '../services/graphql_service.dart';
-import '../services/mask_bridge.dart';
 import '../services/paint_spec.dart';
 import '../services/unity_commands.dart';
-import '../services/unity_file_cache.dart';
 
 class CustomizationScreen extends StatefulWidget {
   final Car car;
+  final bool isUniversalMode;
+  final String? initialVehicleLabel;
 
-  const CustomizationScreen({super.key, required this.car});
+  const CustomizationScreen({
+    super.key,
+    required this.car,
+    this.isUniversalMode = false,
+    this.initialVehicleLabel,
+  });
 
   @override
   State<CustomizationScreen> createState() => _CustomizationScreenState();
@@ -27,15 +32,36 @@ class CustomizationScreen extends StatefulWidget {
 
 class _CustomizationScreenState extends State<CustomizationScreen> {
   final Map<String, Asset> _selected = {};
+  List<Asset> _catalogAssets = const [];
   UnityWidgetController? _unityController;
-  String? _unityStatus;
+  String? _unityStatus = 'Starting on-device live car filter…';
   String? _savedConfigId;
+  String? _customVehicleTitle;
   bool _saving = false;
   bool _sharingPhoto = false;
+  bool _capturingForMask = false;
+  bool _capturingForStudioShare = false;
+  bool _maskingBusy = false;
+  bool _hasActiveMask = false;
+  bool _sentisLiveActive = false;
   String _finish = 'gloss';
   String _panel = 'body';
-  String? _paintColor;
+  String? _paintColor = '#9B1B30';
   final _hex = TextEditingController();
+  int _maskSlot = 0;
+
+  String get _displayVehicleTitle {
+    if (_customVehicleTitle != null && _customVehicleTitle!.trim().isNotEmpty) {
+      return _customVehicleTitle!.trim();
+    }
+    if (widget.initialVehicleLabel != null && widget.initialVehicleLabel!.trim().isNotEmpty) {
+      return widget.initialVehicleLabel!.trim();
+    }
+    if (widget.isUniversalMode) {
+      return 'Universal AR Studio · Any Car';
+    }
+    return '${widget.car.year} ${widget.car.make} ${widget.car.model}';
+  }
 
   static const String getAssetsQuery = r'''
     query AssetsForCar($carId: ID!) {
@@ -69,33 +95,259 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     }
   ''';
 
-  Future<void> _loadPreview(UnityWidgetController controller, String meshUrl) async {
-    setState(() => _unityStatus = 'Downloading preview model…');
-    String argument;
-    try {
-      argument = await UnityFileCache.bundledJarUri(meshUrl) ??
-          await UnityFileCache.forUnity(meshUrl);
-    } catch (_) {
-      if (!mounted) return;
-      setState(() => _unityStatus = 'Preview model did not download.');
-      _snack('Could not download the preview model. Is the backend running?');
-      return;
+  static const String segmentLiveCarMutation = r'''
+    mutation SegmentLiveCar($input: IdentifyVehicleInput!) {
+      segmentLiveCar(input: $input) {
+        masked
+        maskBase64
+        polishedBase64
+        paintPixels
+        source
+        reason
+      }
     }
-    if (!mounted || _unityController != controller) return;
-    controller.postMessage(
-      UnityCommands.gameObject,
-      UnityCommands.loadMethod,
-      argument,
-    );
-  }
+  ''';
 
   void _post(UnityCommand? command) {
     if (command == null || _unityController == null) return;
     _unityController!.postMessage(command.gameObject, command.method, command.argument);
   }
 
+  Timer? _autoMaskTimer;
+
+  void _ensureAutoMaskTimer() {
+    _autoMaskTimer ??= Timer.periodic(const Duration(milliseconds: 2200), (_) {
+      if (!mounted) return;
+      if (_sentisLiveActive && !_hasActiveMask && !_maskingBusy && !_sharingPhoto) {
+        _refineMaskWithBackend(silent: true);
+      }
+    });
+  }
+
+  void _startLiveFilter() {
+    if (_unityController == null) return;
+    setState(() {
+      _sentisLiveActive = true;
+      _unityStatus = 'Live filter active · Locking onto car sheet metal…';
+    });
+    _applyCurrentPaint();
+    _post(UnityCommands.runSentis(stop: false));
+    _ensureAutoMaskTimer();
+    _refineMaskWithBackend(silent: true);
+  }
+
+  Future<void> _pauseLiveFilter() async {
+    _autoMaskTimer?.cancel();
+    _autoMaskTimer = null;
+    if (!mounted) return;
+    setState(() {
+      _sentisLiveActive = false;
+      _hasActiveMask = false;
+      _maskingBusy = false;
+      _capturingForMask = false;
+      _unityStatus = 'Live filter paused · Showing untouched camera feed.';
+    });
+    _post(UnityCommands.runSentis(stop: true));
+  }
+
+  Future<void> _refineMaskWithBackend({bool silent = false}) async {
+    if (_unityController == null || _maskingBusy || _sharingPhoto) return;
+    setState(() {
+      _maskingBusy = true;
+      _capturingForMask = true;
+      _capturingForStudioShare = false;
+      if (!silent || !_hasActiveMask) {
+        _unityStatus = 'Locking live paint mask onto car body…';
+      }
+    });
+
+    _post(UnityCommands.captureSnapshot(clean: true));
+    Future<void>.delayed(const Duration(seconds: 5), () {
+      if (!mounted || !_capturingForMask) return;
+      setState(() {
+        _capturingForMask = false;
+        _maskingBusy = false;
+        if (!silent) {
+          _unityStatus = 'Camera frame capture timed out.';
+        }
+      });
+    });
+  }
+
+  Future<void> _processLiveMaskSnapshot(String path) async {
+    try {
+      final file = File(path);
+      if (!await file.exists()) {
+        if (!mounted) return;
+        setState(() {
+          _maskingBusy = false;
+          _unityStatus = 'Could not read camera frame.';
+        });
+        return;
+      }
+
+      final bytes = await file.readAsBytes();
+      try {
+        await file.delete();
+      } catch (_) {}
+
+      if (!mounted || !_sentisLiveActive) {
+        if (mounted) {
+          setState(() => _maskingBusy = false);
+        }
+        return;
+      }
+      final client = GraphQLProvider.of(context).value;
+      final result = await client.mutate(
+        MutationOptions(
+          document: gql(segmentLiveCarMutation),
+          fetchPolicy: FetchPolicy.noCache,
+          variables: {
+            'input': {
+              'imageBase64': base64Encode(bytes),
+              'mimeType': 'image/png',
+              'hexColor': _paintColor ?? '#9B1B30',
+              'finish': _finish,
+              'panel': _panel,
+              'repolishOnly': false,
+            },
+          },
+        ),
+      );
+
+      if (!mounted || !_sentisLiveActive) {
+        if (mounted) {
+          setState(() => _maskingBusy = false);
+        }
+        return;
+      }
+      final data = result.data?['segmentLiveCar'] as Map<String, dynamic>?;
+      if (result.hasException || data == null || data['masked'] != true || data['maskBase64'] == null) {
+        final gqlErr = result.exception?.graphqlErrors.isNotEmpty == true
+            ? result.exception!.graphqlErrors.first.message
+            : result.exception?.linkException?.toString();
+        final reason = data?['reason']?.toString() ??
+            (gqlErr != null ? 'Mask server busy — retrying automatically…' : 'Point camera at the car — auto-locking mask…');
+        setState(() {
+          _maskingBusy = false;
+          _unityStatus = reason;
+        });
+        return;
+      }
+
+      final maskBytes = base64Decode(data['maskBase64'] as String);
+      _maskSlot = (_maskSlot + 1) % 2;
+      final maskFile = File(
+        '${Directory.systemTemp.path}/arcar-live-mask-$_maskSlot.png',
+      );
+      await maskFile.writeAsBytes(maskBytes, flush: true);
+
+      if (!mounted || !_sentisLiveActive) return;
+      _post(UnityCommands.loadMask(maskFile.path));
+      _applyCurrentPaint();
+
+      setState(() {
+        _maskingBusy = false;
+        _hasActiveMask = true;
+        _unityStatus = 'Live car filter active · Tap any color or finish below';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _maskingBusy = false;
+        _unityStatus = 'Masking error: $error';
+      });
+    }
+  }
+
+  /// Studio photo polisher: used ONLY when exporting/sharing the Auto-Body Shop Reference still.
+  /// Never covers the live camera viewport.
+  Future<void> _exportBodyShopReference() async {
+    if (_unityController == null || _sharingPhoto || _maskingBusy) return;
+    setState(() {
+      _sharingPhoto = true;
+      _capturingForStudioShare = true;
+      _capturingForMask = false;
+      _unityStatus = 'Polishing studio reference photo for share…';
+    });
+
+    _post(UnityCommands.captureSnapshot(clean: true));
+    Future<void>.delayed(const Duration(seconds: 6), () {
+      if (!mounted || !_capturingForStudioShare) return;
+      setState(() {
+        _capturingForStudioShare = false;
+        _sharingPhoto = false;
+      });
+      _snack('Snapshot timed out.');
+    });
+  }
+
+  Future<void> _processStudioShareSnapshot(String path) async {
+    final file = File(path);
+    if (!await file.exists()) {
+      if (!mounted) return;
+      setState(() => _sharingPhoto = false);
+      _snack('The camera frame was not written.');
+      return;
+    }
+
+    try {
+      final rawBytes = await file.readAsBytes();
+      if (!mounted) return;
+      final paintName = _selected['PAINT']?.name ?? 'Custom Paint';
+      final client = GraphQLProvider.of(context).value;
+      final result = await client.mutate(
+        MutationOptions(
+          document: gql(segmentLiveCarMutation),
+          fetchPolicy: FetchPolicy.noCache,
+          variables: {
+            'input': {
+              'imageBase64': base64Encode(rawBytes),
+              'mimeType': 'image/png',
+              'hexColor': _paintColor ?? '#9B1B30',
+              'finish': _finish,
+              'panel': _panel,
+              'repolishOnly': false,
+            },
+          },
+        ),
+      );
+
+      String shareFilePath = path;
+      final data = result.data?['segmentLiveCar'] as Map<String, dynamic>?;
+      final polishedB64 = data?['polishedBase64'] as String?;
+      if (polishedB64 != null && polishedB64.isNotEmpty) {
+        final polishedFile = File(
+          '${Directory.systemTemp.path}/autocraft-reference-${DateTime.now().millisecondsSinceEpoch}.png',
+        );
+        await polishedFile.writeAsBytes(base64Decode(polishedB64), flush: true);
+        shareFilePath = polishedFile.path;
+        try {
+          await file.delete();
+        } catch (_) {}
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _sharingPhoto = false;
+        _unityStatus = 'Live filter active · Studio reference ready to share';
+      });
+
+      await Share.shareXFiles(
+        [XFile(shareFilePath)],
+        text:
+            'Auto-Body Shop Paint Reference · $_displayVehicleTitle · $paintName (${_paintColor ?? "#9B1B30"}) · Finish: ${_finish.toUpperCase()} · Panel: ${_panel.toUpperCase()}',
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _sharingPhoto = false);
+      _snack('Could not share reference photo: $error');
+    }
+  }
+
   @override
   void dispose() {
+    _autoMaskTimer?.cancel();
     _hex.dispose();
     super.dispose();
   }
@@ -109,17 +361,18 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
         _finish = finish;
         _paintColor = color;
       });
+      // Instant 0ms tint update on the live moving camera—never pauses to take a photo
       _sendPaint(color: color, finish: finish, panel: _panel);
+      if (!_sentisLiveActive) {
+        _startLiveFilter();
+      } else if (!_hasActiveMask && !_maskingBusy) {
+        _refineMaskWithBackend(silent: true);
+      }
       return;
     }
 
     setState(() => _selected[asset.type] = asset);
-    _post(UnityCommands.forAsset(
-      type: asset.type,
-      value: asset.name,
-      url: UnityCommands.partUrl(asset.materialBundleUrl),
-      anchor: asset.anchor,
-    ));
+    _snack('${asset.name} selected for build quote.');
   }
 
   void _sendPaint({
@@ -152,25 +405,80 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       _selected.remove('PAINT');
     });
     _sendPaint(color: color, finish: _finish, panel: _panel);
+    if (!_sentisLiveActive) {
+      _startLiveFilter();
+    } else if (!_hasActiveMask && !_maskingBusy) {
+      _refineMaskWithBackend(silent: true);
+    }
   }
 
-  Future<void> _shareSnapshot(String path) async {
-    final file = File(path);
-    if (!await file.exists()) {
-      if (!mounted) return;
-      _snack('The AR photo was not written.');
-      return;
-    }
-    try {
-      await Share.shareXFiles(
-        [XFile(path)],
-        text:
-            'AR paint preview · ${widget.car.year} ${widget.car.make} ${widget.car.model} · $_finish $_panel',
-      );
-    } catch (error) {
-      if (!mounted) return;
-      _snack('Could not open the share sheet: $error');
-    }
+  Future<String?> _promptGarageVehicleName() async {
+    final paintLabel = _selected['PAINT']?.name ?? '${_finish.toUpperCase()} ${_paintColor ?? "#9B1B30"}';
+    final initialText = (_customVehicleTitle != null && _customVehicleTitle!.trim().isNotEmpty)
+        ? _customVehicleTitle!.trim()
+        : (widget.isUniversalMode
+            ? 'My Custom Vehicle ($paintLabel)'
+            : '${widget.car.year} ${widget.car.make} ${widget.car.model} ($paintLabel)');
+    final controller = TextEditingController(text: initialText);
+
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF161B22),
+          title: const Text('Save Vehicle to Your Garage'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Name any car you just masked & customized (Make, Model, Plate, or Build Name):',
+                style: TextStyle(fontSize: 13, color: Colors.white70),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: 'Vehicle / Build Name',
+                  hintText: 'e.g. 2018 Toyota Corolla · Candy Red',
+                ),
+              ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  for (final preset in [
+                    'Toyota Corolla ($paintLabel)',
+                    'Toyota Camry ($paintLabel)',
+                    'Toyota Matrix Hatchback ($paintLabel)',
+                    'Custom SUV / Sedan ($paintLabel)',
+                  ])
+                    ActionChip(
+                      label: Text(preset, style: const TextStyle(fontSize: 11)),
+                      onPressed: () => controller.text = preset,
+                    ),
+                ],
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final text = controller.text.trim();
+                Navigator.pop(ctx, text.isEmpty ? initialText : text);
+              },
+              child: const Text('Save to Garage'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Future<void> _saveConfig() async {
@@ -178,12 +486,28 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       _snack('Log in again before saving.');
       return;
     }
+
+    // If user only adjusted live AR paint/hex without tapping a catalog card, auto-bind a paint asset
+    if (_selected.isEmpty && _catalogAssets.isNotEmpty) {
+      final fallbackPaint = _catalogAssets.firstWhere(
+        (a) => a.type == 'PAINT',
+        orElse: () => _catalogAssets.first,
+      );
+      _selected[fallbackPaint.type] = fallbackPaint;
+    }
+
     if (_selected.isEmpty) {
-      _snack('Pick a part first.');
+      _snack('Pick a paint or part first.');
       return;
     }
 
-    setState(() => _saving = true);
+    final chosenName = await _promptGarageVehicleName();
+    if (chosenName == null || !mounted) return;
+
+    setState(() {
+      _saving = true;
+      _customVehicleTitle = chosenName;
+    });
     final client = GraphQLProvider.of(context).value;
     final result = await client.mutate(
       MutationOptions(
@@ -193,7 +517,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
             'carId': widget.car.id,
             'assetIds': _selected.values.map((asset) => asset.id).toList(),
             'status': 'DRAFT',
-            'name': '${widget.car.year} ${widget.car.make} ${widget.car.model}',
+            'name': chosenName,
           },
         },
       ),
@@ -210,7 +534,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     }
     final id = result.data?['saveConfiguration']?['id'];
     setState(() => _savedConfigId = id is String ? id : _savedConfigId);
-    _snack('Saved to your garage.');
+    _snack('Saved "$chosenName" to your garage!');
   }
 
   Future<void> _share() async {
@@ -230,30 +554,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       return;
     }
     await Clipboard.setData(ClipboardData(text: token));
-    _snack('Share code copied. It opens this car, not a video.');
-  }
-
-  Future<void> _loadPublishedMask() async {
-    try {
-      final published = await PublishedMaskBridge.fetch();
-      if (!mounted) return;
-      if (published == null) {
-        _snack('No published mask. Run: python ml/segment_car.py --synthetic --publish');
-        return;
-      }
-      final frame = jsonDecode(published.json);
-      if (frame is Map && frame['maskPng'] is String) {
-        frame['maskPng'] = await UnityFileCache.forUnity(frame['maskPng'] as String);
-      }
-      _post(UnityCommands.bridgeFrame(frame is Map ? jsonEncode(frame) : published.json));
-      final note = published.note;
-      _snack(note == null || note.isEmpty
-          ? 'Published mask sent to the camera overlay.'
-          : note);
-    } catch (error) {
-      if (!mounted) return;
-      _snack('Mask bridge failed: $error');
-    }
+    _snack('Share code copied.');
   }
 
   void _snack(String message) {
@@ -261,43 +562,80 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   }
 
   String _statusLabel(String text) {
-    if (text.startsWith('MODEL_LOADED')) return 'Preview model loaded.';
-    if (text.startsWith('MODEL_FAILED')) return 'Preview model did not load.';
-    if (text.startsWith('PAINT_APPLIED')) return 'Paint applied. Finish follows the room light on the preview.';
-    if (text.startsWith('PAINT_QUEUED')) return 'Paint queued until the preview model loads.';
-    if (text.startsWith('ANCHORED:plane')) return 'Preview is sitting on a detected floor.';
-    if (text.startsWith('ANCHORED:camera')) return 'No floor yet. The whole vehicle stays in front of the camera.';
-    if (text.startsWith('ANCHOR_SEARCHING')) return 'Looking for a floor in front of the camera.';
-    if (text.startsWith('SNAPSHOT:')) return 'AR photo ready to share.';
+    if (text.startsWith('SENTIS_LIVE_STARTED') || text.startsWith('MASK_APPLIED:sentis')) {
+      return 'Live car filter active · Move around car & tap any color.';
+    }
+    if (text.startsWith('MASK_APPLIED')) {
+      return 'Live car filter active · Tap any color or finish below.';
+    }
+    if (text.startsWith('LIVE_TINT:')) {
+      return 'Live paint applied ($_finish · $_panel · ${_paintColor ?? ""}).';
+    }
     return text;
   }
 
   void _onUnityMessage(dynamic message) {
     final text = message.toString();
     if (text.startsWith('SNAPSHOT:')) {
-      setState(() {
-        _sharingPhoto = false;
-        _unityStatus = _statusLabel(text);
-      });
-      _shareSnapshot(text.substring('SNAPSHOT:'.length));
+      final snapPath = text.substring('SNAPSHOT:'.length);
+      if (_capturingForStudioShare) {
+        _capturingForStudioShare = false;
+        _processStudioShareSnapshot(snapPath);
+        return;
+      }
+      if (_capturingForMask) {
+        _capturingForMask = false;
+        _processLiveMaskSnapshot(snapPath);
+        return;
+      }
+      setState(() => _sharingPhoto = false);
       return;
     }
     if (text.startsWith('SNAPSHOT_FAILED')) {
-      setState(() => _sharingPhoto = false);
+      setState(() {
+        _sharingPhoto = false;
+        _capturingForStudioShare = false;
+        _capturingForMask = false;
+        _maskingBusy = false;
+      });
+      return;
     }
-    setState(() => _unityStatus = _statusLabel(text));
-    if (text.startsWith('MODEL_FAILED')) {
-      _snack('Preview model did not load. Showing a stand-in car.');
-    } else if (text.startsWith('MODEL_LOADED')) {
-      _snack('Preview model loaded. Look ahead of the phone to see it.');
-    } else if (text.startsWith('PAINT_NO_BODY')) {
-      _snack('Model loaded, but no body material was found to paint.');
-    } else if (text.startsWith('MASK_FAILED') ||
-        text.startsWith('SENTIS_') ||
-        text.startsWith('PART_FAILED') ||
-        text.startsWith('SNAPSHOT_FAILED') ||
-        text.startsWith('ANCHOR_FAILED')) {
-      _snack(text);
+    if (text.startsWith('SENTIS_STOPPED')) {
+      setState(() {
+        _sentisLiveActive = false;
+        _hasActiveMask = false;
+        _unityStatus = 'Live filter paused · Showing untouched camera feed.';
+      });
+      return;
+    }
+    if (text.startsWith('MASK_APPLIED')) {
+      if (!_sentisLiveActive) return;
+      setState(() {
+        _hasActiveMask = true;
+        _unityStatus = _statusLabel(text);
+      });
+      return;
+    }
+    if (text.startsWith('SENTIS_LIVE_STARTED')) {
+      if (!_sentisLiveActive) return;
+      setState(() {
+        _unityStatus = _hasActiveMask
+            ? _statusLabel(text)
+            : 'Live filter active · Locking onto car sheet metal…';
+      });
+      return;
+    }
+    if (text.startsWith('SENTIS_NEEDS_MASK') ||
+        text.startsWith('CAMERA_SETTLED') ||
+        text.startsWith('SENTIS_UNAVAILABLE') ||
+        text.startsWith('SENTIS_NO_MODEL')) {
+      if (_sentisLiveActive && !_maskingBusy && !_sharingPhoto) {
+        _refineMaskWithBackend(silent: true);
+      }
+      return;
+    }
+    if (text.startsWith('LIVE_TINT:')) {
+      setState(() => _unityStatus = _statusLabel(text));
     }
   }
 
@@ -310,30 +648,237 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     return Colors.grey;
   }
 
+  void _showVoiceCommandDialog() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF161B22),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Row(
+                children: [
+                  Icon(Icons.mic, color: Color(0xFF00E5FF)),
+                  SizedBox(width: 10),
+                  Text(
+                    'Hands-Free Voice Commands',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Tap a voice phrase to change the live camera paint tint immediately:',
+                style: TextStyle(color: Colors.white60, fontSize: 13),
+              ),
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  ActionChip(
+                    label: const Text('"Paint Candy Red"'),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      setState(() {
+                        _paintColor = '#D0122D';
+                        _finish = 'candy';
+                      });
+                      _applyCurrentPaint();
+                    },
+                  ),
+                  ActionChip(
+                    label: const Text('"Paint Super White"'),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      setState(() {
+                        _paintColor = '#F2F3F5';
+                        _finish = 'gloss';
+                      });
+                      _applyCurrentPaint();
+                    },
+                  ),
+                  ActionChip(
+                    label: const Text('"Paint Matte Black"'),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      setState(() {
+                        _paintColor = '#1C1C1C';
+                        _finish = 'matte';
+                      });
+                      _applyCurrentPaint();
+                    },
+                  ),
+                  ActionChip(
+                    label: const Text('"Metallic Silver"'),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      setState(() {
+                        _paintColor = '#B7B7BE';
+                        _finish = 'metallic';
+                      });
+                      _applyCurrentPaint();
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final meshUrl = GraphQLService.resolveUrl(widget.car.baseMeshUrl);
-
     return Scaffold(
       appBar: AppBar(
-        title: Text('${widget.car.year} ${widget.car.make} ${widget.car.model}'),
+        title: Text(_displayVehicleTitle, style: const TextStyle(fontSize: 16)),
+        actions: [
+          IconButton(
+            tooltip: 'Hands-Free Voice Controls',
+            icon: const Icon(Icons.mic, color: Color(0xFF00E5FF)),
+            onPressed: _showVoiceCommandDialog,
+          ),
+        ],
       ),
       body: Column(
         children: [
           Expanded(
             flex: 3,
-            child: ColoredBox(
-              color: Colors.black,
-              child: UnityWidget(
-                onUnityCreated: (controller) {
-                  _unityController = controller;
-                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                    if (!mounted) return;
-                    _loadPreview(controller, meshUrl);
-                  });
-                },
-                onUnityMessage: _onUnityMessage,
-              ),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                // Always-live 60 FPS AR camera feed (never covered by a static photo)
+                ColoredBox(
+                  color: Colors.black,
+                  child: UnityWidget(
+                    onUnityCreated: (controller) {
+                      _unityController = controller;
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (!mounted) return;
+                        _applyCurrentPaint();
+                        Future<void>.delayed(const Duration(milliseconds: 600), () {
+                          if (mounted) {
+                            _startLiveFilter();
+                          }
+                        });
+                      });
+                    },
+                    onUnityMessage: _onUnityMessage,
+                  ),
+                ),
+                // Top HUD status pill
+                if (_unityStatus != null)
+                  Positioned(
+                    top: 10,
+                    left: 12,
+                    right: 12,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.72),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: _sentisLiveActive || _hasActiveMask
+                              ? const Color(0xFF00E5FF)
+                              : Colors.white24,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          if (_maskingBusy || _sharingPhoto)
+                            const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Color(0xFF00E5FF),
+                              ),
+                            )
+                          else
+                            Icon(
+                              _sentisLiveActive || _hasActiveMask
+                                  ? Icons.videocam
+                                  : Icons.center_focus_strong,
+                              size: 16,
+                              color: _sentisLiveActive || _hasActiveMask
+                                  ? const Color(0xFF00E5FF)
+                                  : Colors.white70,
+                            ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              _unityStatus!,
+                              style: const TextStyle(fontSize: 12, color: Colors.white),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                // Bottom live camera filter controls
+                Positioned(
+                  bottom: 10,
+                  left: 12,
+                  right: 12,
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _sentisLiveActive
+                                ? const Color(0xFF00E5FF)
+                                : const Color(0xFF161B22),
+                            foregroundColor: _sentisLiveActive ? Colors.black : Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 10),
+                          ),
+                          onPressed: _unityController == null
+                              ? null
+                              : () {
+                                  if (_sentisLiveActive) {
+                                    _pauseLiveFilter();
+                                  } else {
+                                    _startLiveFilter();
+                                  }
+                                },
+                          icon: Icon(
+                            _sentisLiveActive ? Icons.auto_fix_high : Icons.play_arrow,
+                            size: 18,
+                          ),
+                          label: Text(
+                            _sentisLiveActive ? 'Live Filter Active' : 'Start Live Filter',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          backgroundColor: Colors.black.withValues(alpha: 0.65),
+                          foregroundColor: const Color(0xFF00E5FF),
+                          side: const BorderSide(color: Color(0xFF00E5FF)),
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        ),
+                        onPressed: _unityController == null || _maskingBusy
+                            ? null
+                            : _refineMaskWithBackend,
+                        icon: const Icon(Icons.hd_outlined, size: 18),
+                        label: const Text('HD Cut'),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
           ),
           Expanded(
@@ -361,16 +906,15 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                           .whereType<Map>()
                           .map((json) => Asset.fromJson(Map<String, dynamic>.from(json)))
                           .toList();
+                      _catalogAssets = assets;
                       return ListView(
-                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                        padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
                         children: [
                           const Text(
-                            'Finishes show on the preview immediately. Gloss, candy, and metallic pick up room light. Hood, roof, and doors are regions on the preview, not a scan of those panels. Camera tint still waits for a mask, then crops to the selected region.',
-                            style: TextStyle(fontSize: 12, color: Colors.black54),
+                            'Camera stays live as you move around your car. Tap any Paint Color or Finish for an instant tint change, then tap "Share Auto-Body Shop Reference" when ready.',
+                            style: TextStyle(fontSize: 12, color: Colors.white70),
                           ),
-                          if (_unityStatus != null)
-                            Text(_unityStatus!, style: const TextStyle(fontSize: 11, color: Colors.black45)),
-                          const SizedBox(height: 8),
+                          const SizedBox(height: 6),
                           _choiceRow('Finish', PaintSpec.finishes, _finish, (value) {
                             setState(() => _finish = value);
                             _applyCurrentPaint();
@@ -402,41 +946,20 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                             ],
                           ),
                           const SizedBox(height: 8),
-                          _section('Paint', assets.where((asset) => asset.type == 'PAINT'), paint: true),
+                          _section('Paint Colors (Live Camera Filter)', assets.where((asset) => asset.type == 'PAINT'), paint: true),
                           _section('Rims', assets.where((asset) => asset.type == 'RIM')),
                           _section('Spoilers', assets.where((asset) => asset.type == 'SPOILER')),
                           const SizedBox(height: 8),
-                          OutlinedButton(
-                            onPressed: _unityController == null ? null : _loadPublishedMask,
-                            child: const Text('Apply published segmentation mask'),
-                          ),
-                          OutlinedButton(
-                            onPressed: _unityController == null
+                          OutlinedButton.icon(
+                            onPressed: _unityController == null || _sharingPhoto || _maskingBusy
                                 ? null
-                                : () => _unityController!.postMessage(
-                                      UnityCommands.gameObject,
-                                      UnityCommands.sentisMethod,
-                                      '',
-                                    ),
-                            child: const Text('Run on-device segmentation'),
-                          ),
-                          OutlinedButton(
-                            onPressed: _unityController == null ? null : () => _post(UnityCommands.anchorToSurface()),
-                            child: const Text('Sit preview on detected floor'),
-                          ),
-                          OutlinedButton(
-                            onPressed: _unityController == null || _sharingPhoto
-                                ? null
-                                : () {
-                                    setState(() => _sharingPhoto = true);
-                                    _post(UnityCommands.captureSnapshot());
-                                    Future<void>.delayed(const Duration(seconds: 4), () {
-                                      if (!mounted || !_sharingPhoto) return;
-                                      setState(() => _sharingPhoto = false);
-                                      _snack('No photo came back. Re-export Unity if this phone build is old.');
-                                    });
-                                  },
-                            child: Text(_sharingPhoto ? 'Saving photo…' : 'Save AR photo'),
+                                : _exportBodyShopReference,
+                            icon: const Icon(Icons.share_outlined, size: 18),
+                            label: Text(
+                              _sharingPhoto
+                                  ? 'Polishing Studio Reference Photo…'
+                                  : 'Share Auto-Body Shop Reference Photo',
+                            ),
                           ),
                         ],
                       );
@@ -531,7 +1054,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
             decoration: BoxDecoration(
               color: _swatch(asset),
               borderRadius: BorderRadius.circular(8),
-              border: selected ? Border.all(color: Colors.blue, width: 3) : null,
+              border: selected ? Border.all(color: const Color(0xFF00E5FF), width: 3) : Border.all(color: Colors.white24),
             ),
             child: selected ? const Icon(Icons.check, color: Colors.white) : null,
           ),
@@ -544,17 +1067,12 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
 
   Widget _partTile(Asset asset) {
     final selected = _selected[asset.type]?.id == asset.id;
-    final standIn = asset.materialBundleUrl.startsWith('primitive:');
     return ListTile(
       contentPadding: EdgeInsets.zero,
       selected: selected,
       title: Text(asset.name),
-      subtitle: Text(
-        standIn
-            ? 'Stand-in shape · ₦${asset.price.toStringAsFixed(0)}'
-            : '₦${asset.price.toStringAsFixed(0)}',
-      ),
-      trailing: selected ? const Icon(Icons.check) : null,
+      subtitle: Text('₦${asset.price.toStringAsFixed(0)}'),
+      trailing: selected ? const Icon(Icons.check, color: Color(0xFF00E5FF)) : null,
       onTap: () => _select(asset),
     );
   }

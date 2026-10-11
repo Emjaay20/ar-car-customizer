@@ -1,0 +1,39 @@
+{
+  "status": "ok",
+  "damageCount": 3,
+  "damages": [
+    {
+      "damageType": "SCRATCH",
+      "severity": "MINOR",
+      "confidence": 0.94,
+      "affectedPanel": "FRONT_BUMPER",
+      "areaPercentage": 3.2,
+      "boundingBoxJson": "{\"x\": 0.18, \"y\": 0.6, \"width\": 0.08, \"height\": 0.04}",
+      "spatialAnchorJson": "{\"x\": -0.616, \"y\": 0.532, \"z\": 1.8}",
+      "recommendedAction": "BUFF",
+      "estimatedLaborHours": 1.0
+    },
+    {
+      "damageType": "DENT",
+      "severity": "MODERATE",
+      "confidence": 0.88,
+      "affectedPanel": "HOOD",
+      "areaPercentage": 11.5,
+      "boundingBoxJson": "{\"x\": 0.38, \"y\": 0.32, \"width\": 0.14, \"height\": 0.12}",
+      "spatialAnchorJson": "{\"x\": -0.11, \"y\": 0.868, \"z\": 1.2}",
+      "recommendedAction": "REPAIR",
+      "estimatedLaborHours": 2.2
+    },
+    {
+      "damageType": "CRACK",
+      "severity": "MODERATE",
+      "confidence": 0.91,
+      "affectedPanel": "REAR_BUMPER",
+      "areaPercentage": 5.8,
+      "boundingBoxJson": "{\"x\": 0.77, \"y\": 0.65, \"width\": 0.1, \"height\": 0.06}",
+      "spatialAnchorJson": "{\"x\": 0.704, \"y\": 0.448, \"z\": -1.8}",
+      "recommendedAction": "REPAIR",
+      "estimatedLaborHours": 2.2
+    }
+  ]
+}

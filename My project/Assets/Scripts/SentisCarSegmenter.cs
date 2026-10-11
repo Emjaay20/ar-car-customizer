@@ -1,22 +1,59 @@
+using System.Collections;
 using FlutterUnityIntegration;
 using UnityEngine;
+using UnityEngine.XR.ARFoundation;
 
 /// <summary>
-/// On-device segmentation hook. Compiles without Inference Engine.
-/// Enable it by installing com.unity.ai.inference, adding scripting define ARCAR_INFERENCE_ENGINE,
-/// and placing a ModelAsset named CarSegMask in a Resources folder.
-/// ONNX contract: input float32 NCHW 1x3x256x256 RGB 0..1, output a 256x256 paint probability.
-/// Do not assign a raw YOLOv8-seg graph; export a model that already outputs the body mask.
+/// Manages the live car filter loop and 6DoF AR camera motion tracking.
+/// Coordinates with the high-precision YOLOv8s-seg mask pipeline and ensures
+/// Adreno 830 Vulkan never suffers from GPUCompute shader compilation errors or blank-mask overwrites.
 /// </summary>
 public class SentisCarSegmenter : MonoBehaviour
 {
+    bool loopActive;
+    bool externalMaskActive;
+    Coroutine loopCoroutine;
+
+    Vector3 lastSettledPos;
+    Quaternion lastSettledRot = Quaternion.identity;
+    bool initializedPose;
+
+    public bool IsLoopActive => loopActive;
+
+    public void NotifyExternalMaskApplied()
+    {
+        externalMaskActive = true;
+        var cam = Camera.main;
+        if (cam != null)
+        {
+            lastSettledPos = cam.transform.position;
+            lastSettledRot = cam.transform.rotation;
+            initializedPose = true;
+        }
+    }
+
     public void Run()
     {
-#if ARCAR_INFERENCE_ENGINE
-        StartCoroutine(RunInference());
-#else
-        Report("SENTIS_UNAVAILABLE:Install com.unity.ai.inference, add scripting define ARCAR_INFERENCE_ENGINE, and place a 256x256 mask ModelAsset at Resources/CarSegMask.");
-#endif
+        StartLiveLoop();
+    }
+
+    public void StartLiveLoop()
+    {
+        if (loopActive && loopCoroutine != null)
+            return;
+        loopActive = true;
+        loopCoroutine = StartCoroutine(LiveLoopRoutine());
+    }
+
+    public void StopLiveLoop()
+    {
+        loopActive = false;
+        externalMaskActive = false;
+        if (loopCoroutine != null)
+        {
+            StopCoroutine(loopCoroutine);
+            loopCoroutine = null;
+        }
     }
 
     static void Report(string message)
@@ -25,98 +62,96 @@ public class SentisCarSegmenter : MonoBehaviour
         NativeAPI.SendMessageToFlutter(message);
     }
 
-#if ARCAR_INFERENCE_ENGINE
-    const int Size = 256;
-    Unity.InferenceEngine.Worker worker;
-
-    System.Collections.IEnumerator RunInference()
+    IEnumerator LiveLoopRoutine()
     {
-        var modelAsset = Resources.Load<Unity.InferenceEngine.ModelAsset>("CarSegMask");
-        if (modelAsset == null)
-        {
-            Report("SENTIS_NO_MODEL:Resources/CarSegMask is missing.");
-            yield break;
-        }
+        Report("SENTIS_LIVE_STARTED");
+        Report("SENTIS_NEEDS_MASK");
 
-        Texture2D frame = null;
-        string grabError = null;
-        yield return GrabCameraFrame(value => frame = value, reason => grabError = reason);
-        if (frame == null)
-        {
-            Report(grabError ?? "SENTIS_NO_FRAME");
-            yield break;
-        }
+        Vector3 prevPos = Vector3.zero;
+        Quaternion prevRot = Quaternion.identity;
+        bool hasMovedSinceSettle = false;
+        float stillDuration = 0f;
+        float lastTriggerTime = Time.unscaledTime;
 
-        var runtime = Unity.InferenceEngine.ModelLoader.Load(modelAsset);
-        worker ??= new Unity.InferenceEngine.Worker(runtime, Unity.InferenceEngine.BackendType.GPUCompute);
-        using var input = new Unity.InferenceEngine.Tensor<float>(new Unity.InferenceEngine.TensorShape(1, 3, Size, Size));
-        Unity.InferenceEngine.TextureConverter.ToTensor(frame, input);
-        worker.Schedule(input);
+        const float pollInterval = 0.08f;
+        const float moveAngleThreshold = 2.8f;
+        const float moveDistThreshold = 0.045f;
+        const float largePanAngleThreshold = 8.5f;
+        const float largePanDistThreshold = 0.14f;
+        const float stillAngleDeltaMax = 0.9f;
+        const float stillDistDeltaMax = 0.015f;
+        const float settleHoldSeconds = 0.20f;
+        const float minCooldownSeconds = 0.55f;
 
-        var output = worker.PeekOutput() as Unity.InferenceEngine.Tensor<float>;
-        var values = output != null ? output.DownloadToArray() : null;
-        if (values == null || values.Length < Size * Size)
+        while (loopActive)
         {
-            Report("SENTIS_BAD_OUTPUT:expected a 256x256 paint mask, not a raw detection graph.");
-            yield break;
-        }
+            var cam = Camera.main;
+            if (cam != null)
+            {
+                Vector3 curPos = cam.transform.position;
+                Quaternion curRot = cam.transform.rotation;
 
-        var mask = new Texture2D(Size, Size, TextureFormat.R8, false);
-        var pixels = new byte[Size * Size];
-        var offset = values.Length - pixels.Length;
-        for (var i = 0; i < pixels.Length; i++)
-            pixels[i] = values[offset + i] >= 0.5f ? (byte)255 : (byte)0;
-        mask.LoadRawTextureData(pixels);
-        mask.Apply();
+                if (!initializedPose)
+                {
+                    initializedPose = true;
+                    lastSettledPos = curPos;
+                    lastSettledRot = curRot;
+                    prevPos = curPos;
+                    prevRot = curRot;
+                }
+                else
+                {
+                    float angleFromSettled = Quaternion.Angle(curRot, lastSettledRot);
+                    float distFromSettled = Vector3.Distance(curPos, lastSettledPos);
+                    if (angleFromSettled > moveAngleThreshold || distFromSettled > moveDistThreshold)
+                    {
+                        hasMovedSinceSettle = true;
+                    }
 
-        var filter = LiveCarFilter.Ensure(Camera.main);
-        if (filter == null || !filter.SetMask(mask))
-        {
-            Report("MASK_FAILED:no-camera");
-            yield break;
-        }
-        Report("MASK_APPLIED:sentis");
-    }
+                    // If user pans significantly to a new angle or a different car, clear the stale angle mask immediately
+                    if (externalMaskActive && (angleFromSettled > largePanAngleThreshold || distFromSettled > largePanDistThreshold))
+                    {
+                        externalMaskActive = false;
+                        var filter = LiveCarFilter.Ensure(cam);
+                        if (filter != null)
+                            filter.SetMask(null);
+                    }
 
-    static System.Collections.IEnumerator GrabCameraFrame(System.Action<Texture2D> onFrame, System.Action<string> onError)
-    {
-        var manager = FindAnyObjectByType<UnityEngine.XR.ARFoundation.ARCameraManager>();
-        if (manager == null || !manager.TryAcquireLatestCpuImage(out var image))
-        {
-            onError("SENTIS_NO_FRAME:AR camera has no CPU image yet.");
-            onFrame(null);
-            yield break;
-        }
+                    float frameAngleDelta = Quaternion.Angle(curRot, prevRot);
+                    float frameDistDelta = Vector3.Distance(curPos, prevPos);
 
-        var conversion = new UnityEngine.XR.ARSubsystems.XRCpuImage.ConversionParams
-        {
-            inputRect = new RectInt(0, 0, image.width, image.height),
-            outputDimensions = new Vector2Int(Size, Size),
-            outputFormat = TextureFormat.RGB24,
-            transformation = UnityEngine.XR.ARSubsystems.XRCpuImage.Transformation.MirrorY,
-        };
-        var buffer = new Unity.Collections.NativeArray<byte>(
-            image.GetConvertedDataSize(conversion),
-            Unity.Collections.Allocator.Temp);
-        try
-        {
-            image.Convert(conversion, buffer);
-            var texture = new Texture2D(Size, Size, TextureFormat.RGB24, false);
-            texture.LoadRawTextureData(buffer);
-            texture.Apply();
-            onFrame(texture);
+                    if (frameAngleDelta < stillAngleDeltaMax && frameDistDelta < stillDistDeltaMax)
+                    {
+                        stillDuration += pollInterval;
+                    }
+                    else
+                    {
+                        stillDuration = 0f;
+                    }
+
+                    prevPos = curPos;
+                    prevRot = curRot;
+
+                    if (hasMovedSinceSettle &&
+                        stillDuration >= settleHoldSeconds &&
+                        (Time.unscaledTime - lastTriggerTime) >= minCooldownSeconds)
+                    {
+                        hasMovedSinceSettle = false;
+                        stillDuration = 0f;
+                        lastSettledPos = curPos;
+                        lastSettledRot = curRot;
+                        lastTriggerTime = Time.unscaledTime;
+                        Report("CAMERA_SETTLED");
+                    }
+                }
+            }
+
+            yield return new WaitForSeconds(pollInterval);
         }
-        finally
-        {
-            buffer.Dispose();
-            image.Dispose();
-        }
-        yield return null;
     }
 
     void OnDestroy()
     {
-        worker?.Dispose();
+        loopActive = false;
     }
-#endif
 }

@@ -14,6 +14,8 @@ model User {
   fullName       String
   createdAt      DateTime            @default(now())
   configurations UserConfiguration[]
+  inspections    InspectionSession[]
+  jobCards       JobCard[]
 }
 
 model CarModel {
@@ -24,6 +26,7 @@ model CarModel {
   baseMeshUrl    String
   configurations UserConfiguration[]
   fitments       AssetFitment[]
+  inspections    InspectionSession[]
 }
 
 enum AssetType {
@@ -81,4 +84,150 @@ model ConfigurationAsset {
   asset         Asset             @relation(fields: [assetId], references: [id])
 
   @@id([configurationId, assetId])
+}
+
+enum DamageType {
+  SCRATCH
+  DENT
+  CRACK
+  TEAR
+  SHATTER
+  RUST
+  PAINT_CHIP
+}
+
+enum SeverityLevel {
+  MINOR
+  MODERATE
+  SEVERE
+  CRITICAL
+}
+
+enum RepairAction {
+  REPAIR
+  REPLACE
+  REPAINT
+  BUFF
+  INSPECT_FURTHER
+}
+
+enum InspectionStatus {
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum JobCardStatus {
+  DRAFT
+  ESTIMATED
+  CUSTOMER_APPROVED
+  IN_PROGRESS
+  QUALITY_CHECK
+  COMPLETED
+  INVOICED
+}
+
+enum PriorityLevel {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+model InspectionSession {
+  id           String           @id @default(uuid()) @db.Uuid
+  userId       String           @db.Uuid
+  carId        String?          @db.Uuid
+  licensePlate String?
+  vin          String?
+  make         String?
+  model        String?
+  year         Int?
+  status       InspectionStatus @default(IN_PROGRESS)
+  imageUrl     String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  user         User             @relation(fields: [userId], references: [id])
+  car          CarModel?        @relation(fields: [carId], references: [id])
+  damages      DamageRecord[]
+  estimate     CostEstimate?
+  jobCard      JobCard?
+}
+
+model DamageRecord {
+  id                  String            @id @default(uuid()) @db.Uuid
+  inspectionId        String            @db.Uuid
+  damageType          DamageType
+  severity            SeverityLevel
+  confidence          Float
+  affectedPanel       String
+  areaPercentage      Float
+  boundingBox         Json
+  spatialAnchor       Json?
+  maskUrl             String?
+  recommendedAction   RepairAction      @default(REPAIR)
+  estimatedLaborHours Float             @default(1.0)
+  createdAt           DateTime          @default(now())
+
+  inspection          InspectionSession @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+}
+
+model CostEstimate {
+  id                String            @id @default(uuid()) @db.Uuid
+  inspectionId      String            @unique @db.Uuid
+  laborCost         Float
+  paintMaterialCost Float
+  partsCost         Float
+  subtotal          Float
+  tax               Float
+  total             Float
+  currency          String            @default("USD")
+  priceBandMin      Float
+  priceBandMax      Float
+  createdAt         DateTime          @default(now())
+
+  inspection        InspectionSession @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+}
+
+model JobCard {
+  id                      String            @id @default(uuid()) @db.Uuid
+  jobNumber               String            @unique
+  inspectionId            String            @unique @db.Uuid
+  userId                  String            @db.Uuid
+  technicianName          String?
+  status                  JobCardStatus     @default(DRAFT)
+  priority                PriorityLevel     @default(NORMAL)
+  customerNotes           String?
+  internalNotes           String?
+  estimatedCompletionDate DateTime?
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+
+  inspection              InspectionSession @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  user                    User              @relation(fields: [userId], references: [id])
+  partsRequired           JobCardPart[]
+}
+
+model PartItem {
+  id            String        @id @default(uuid()) @db.Uuid
+  sku           String        @unique
+  name          String
+  category      String
+  unitCost      Float
+  stockQuantity Int           @default(0)
+  createdAt     DateTime      @default(now())
+  jobCardLinks  JobCardPart[]
+}
+
+model JobCardPart {
+  jobCardId String   @db.Uuid
+  partId    String   @db.Uuid
+  quantity  Int      @default(1)
+  unitPrice Float
+
+  jobCard   JobCard  @relation(fields: [jobCardId], references: [id], onDelete: Cascade)
+  part      PartItem @relation(fields: [partId], references: [id])
+
+  @@id([jobCardId, partId])
 }

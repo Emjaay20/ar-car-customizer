@@ -32,9 +32,18 @@ My project/*.app
 My project/Assets/AssetStoreTools*
 My project/Assets/StreamingAssets/aa*
 
-# Segmentation prototype output
+# Segmentation prototype output & models
 ml/out/
 backend/public/masks/
+__pycache__/
+*.py[cod]
+*$py.class
+ml/*.pt
+CarSegMask.onnx.data
+yolov8n-seg.onnx
+scratch/
+*.log
+My
 
 # Node
 backend/node_modules/

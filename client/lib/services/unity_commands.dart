@@ -25,6 +25,9 @@ class UnityCommands {
   static const applyPaintMethod = 'ApplyPaint';
   static const snapshotMethod = 'CaptureSnapshot';
   static const anchorMethod = 'AnchorToSurface';
+  static const displayDamagePinsMethod = 'DisplayDamagePins';
+  static const clearDamagePinsMethod = 'ClearDamagePins';
+  static const voiceCommandMethod = 'ProcessVoiceCommand';
 
   static UnityCommand? forAsset({
     required String type,
@@ -61,11 +64,19 @@ class UnityCommands {
     );
   }
 
-  static UnityCommand captureSnapshot() {
-    return const UnityCommand(
+  static UnityCommand captureSnapshot({bool clean = false}) {
+    return UnityCommand(
       gameObject: gameObject,
       method: snapshotMethod,
-      argument: '',
+      argument: clean ? 'clean' : '',
+    );
+  }
+
+  static UnityCommand runSentis({bool stop = false}) {
+    return UnityCommand(
+      gameObject: gameObject,
+      method: sentisMethod,
+      argument: stop ? 'stop' : 'start',
     );
   }
 
@@ -74,6 +85,30 @@ class UnityCommands {
       gameObject: gameObject,
       method: anchorMethod,
       argument: '',
+    );
+  }
+
+  static UnityCommand displayDamagePins(String json) {
+    return UnityCommand(
+      gameObject: gameObject,
+      method: displayDamagePinsMethod,
+      argument: json,
+    );
+  }
+
+  static UnityCommand clearDamagePins() {
+    return const UnityCommand(
+      gameObject: gameObject,
+      method: clearDamagePinsMethod,
+      argument: '',
+    );
+  }
+
+  static UnityCommand sendVoiceCommand(String transcript) {
+    return UnityCommand(
+      gameObject: gameObject,
+      method: voiceCommandMethod,
+      argument: transcript,
     );
   }
 
@@ -90,6 +125,16 @@ class UnityCommands {
       gameObject: gameObject,
       method: bridgeMethod,
       argument: json,
+    );
+  }
+
+  static const loadMaskMethod = 'LoadSegmentationMask';
+
+  static UnityCommand loadMask(String url) {
+    return UnityCommand(
+      gameObject: gameObject,
+      method: loadMaskMethod,
+      argument: url,
     );
   }
 

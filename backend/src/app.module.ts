@@ -8,6 +8,8 @@ import { AuthModule } from './auth/auth.module.js';
 import { CarModule } from './car/car.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { VisionModule } from './vision/vision.module.js';
+import { InspectionModule } from './inspection/inspection.module.js';
+import { JobCardModule } from './jobcard/jobcard.module.js';
 
 @Module({
   imports: [
@@ -20,6 +22,8 @@ import { VisionModule } from './vision/vision.module.js';
     AuthModule,
     CarModule,
     VisionModule,
+    InspectionModule,
+    JobCardModule,
   ],
   controllers: [AppController],
   providers: [AppService],

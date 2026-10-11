@@ -94,6 +94,7 @@ class _ScanCarScreenState extends State<ScanCarScreen> {
     final result = await client.mutate(
       MutationOptions(
         document: gql(identifyMutation),
+        fetchPolicy: FetchPolicy.noCache,
         variables: {
           'input': {
             'imageBase64': base64Encode(bytes),
@@ -173,14 +174,20 @@ class _ScanCarScreenState extends State<ScanCarScreen> {
             ],
             if (car != null) ...[
               const SizedBox(height: 16),
-              ElevatedButton(
+              ElevatedButton.icon(
+                icon: const Icon(Icons.auto_fix_high),
                 onPressed: () {
                   Navigator.push(
                     context,
-                    MaterialPageRoute(builder: (_) => CustomizationScreen(car: car)),
+                    MaterialPageRoute(
+                      builder: (_) => CustomizationScreen(
+                        car: car,
+                        isUniversalMode: true,
+                      ),
+                    ),
                   );
                 },
-                child: Text('Customize ${car.year} ${car.make} ${car.model}'),
+                label: const Text('Mask & Customize in Live AR Studio'),
               ),
             ],
           ],

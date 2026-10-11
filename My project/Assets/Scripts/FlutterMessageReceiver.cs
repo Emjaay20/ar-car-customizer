@@ -36,6 +36,8 @@ public class FlutterMessageReceiver : MonoBehaviour
 
         var bridge = new GameObject("FlutterMessageReceiver");
         bridge.AddComponent<FlutterMessageReceiver>();
+        bridge.AddComponent<SpatialDamageAnchorManager>();
+        bridge.AddComponent<VoiceCommandDispatcher>();
         DontDestroyOnLoad(bridge);
     }
 
@@ -82,9 +84,9 @@ public class FlutterMessageReceiver : MonoBehaviour
             SendMessageToFlutter("PAINT_NO_BODY:" + request.color);
     }
 
-    public void CaptureSnapshot(string unused)
+    public void CaptureSnapshot(string mode)
     {
-        StartCoroutine(CaptureSnapshotRoutine());
+        StartCoroutine(CaptureSnapshotRoutine(mode));
     }
 
     public void AnchorToSurface(string unused)
@@ -97,6 +99,28 @@ public class FlutterMessageReceiver : MonoBehaviour
 
         CarSurfaceAnchor.Begin(currentCar);
         SendMessageToFlutter("ANCHOR_SEARCHING");
+    }
+
+    public void DisplayDamagePins(string jsonPayload)
+    {
+        SpatialDamageAnchorManager.Instance?.SetCarTarget(currentCar);
+        SpatialDamageAnchorManager.Instance?.DisplayDamagePins(jsonPayload);
+        SendMessageToFlutter("DAMAGE_PINS_UPDATED");
+    }
+
+    public void ClearDamagePins(string unused)
+    {
+        SpatialDamageAnchorManager.Instance?.ClearPins();
+        SendMessageToFlutter("DAMAGE_PINS_CLEARED");
+    }
+
+    public void ProcessVoiceCommand(string transcript)
+    {
+        var dispatcher = GetComponent<VoiceCommandDispatcher>();
+        if (dispatcher != null)
+            dispatcher.ProcessVoiceCommand(transcript);
+        else
+            SendMessageToFlutter("VOICE_FAILED:no-dispatcher");
     }
 
     public void ChangeRims(string rimName)
@@ -170,12 +194,23 @@ public class FlutterMessageReceiver : MonoBehaviour
             LoadSegmentationMask(frame.maskPng);
     }
 
-    public void RunSentis()
+    public void RunSentis(string mode)
     {
         var segmenter = GetComponent<SentisCarSegmenter>();
         if (segmenter == null)
             segmenter = gameObject.AddComponent<SentisCarSegmenter>();
-        segmenter.Run();
+
+        if (string.Equals(mode, "stop", StringComparison.OrdinalIgnoreCase))
+        {
+            segmenter.StopLiveLoop();
+            var filter = LiveCarFilter.Ensure(Camera.main);
+            if (filter != null)
+                filter.SetMask(null);
+            SendMessageToFlutter("SENTIS_STOPPED");
+            return;
+        }
+
+        segmenter.StartLiveLoop();
     }
 
     void Update()
@@ -257,12 +292,20 @@ public class FlutterMessageReceiver : MonoBehaviour
         }
     }
 
+    Texture2D lastMaskTexture;
+
     bool ApplyMaskTexture(Texture2D texture)
     {
         var camera = Camera.main;
         var filter = LiveCarFilter.Ensure(camera);
         if (filter == null || !filter.SetMask(texture))
             return false;
+        if (lastMaskTexture != null && lastMaskTexture != texture)
+            Destroy(lastMaskTexture);
+        lastMaskTexture = texture;
+        var segmenter = GetComponent<SentisCarSegmenter>();
+        if (segmenter != null)
+            segmenter.NotifyExternalMaskApplied();
         if (!string.IsNullOrEmpty(pendingLiveTint))
             ApplyLive(PaintRequest.Parse(pendingLiveTint));
         return true;
@@ -451,10 +494,20 @@ public class FlutterMessageReceiver : MonoBehaviour
         ReplayParts();
     }
 
-    System.Collections.IEnumerator CaptureSnapshotRoutine()
+    System.Collections.IEnumerator CaptureSnapshotRoutine(string mode)
     {
+        bool captureClean = string.Equals(mode, "clean", StringComparison.OrdinalIgnoreCase);
+        var filter = captureClean ? LiveCarFilter.Ensure(Camera.main) : null;
+        bool wasFilterActive = filter != null && filter.gameObject.activeSelf;
+        if (wasFilterActive)
+            filter.gameObject.SetActive(false);
+
         yield return new WaitForEndOfFrame();
         var texture = ScreenCapture.CaptureScreenshotAsTexture();
+
+        if (wasFilterActive && filter != null)
+            filter.gameObject.SetActive(true);
+
         if (texture == null)
         {
             SendMessageToFlutter("SNAPSHOT_FAILED:no-frame");
@@ -463,6 +516,7 @@ public class FlutterMessageReceiver : MonoBehaviour
 
         var bytes = texture.EncodeToPNG();
         Destroy(texture);
+
         var path = Path.Combine(
             Application.persistentDataPath,
             "ar-paint-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss") + ".png");
@@ -523,6 +577,7 @@ public class FlutterMessageReceiver : MonoBehaviour
             Destroy(currentCar);
         currentCar = holder;
         currentCar.name = "ARCar";
+        SpatialDamageAnchorManager.Instance?.SetCarTarget(currentCar);
         FramePreview(currentCar);
         SendMessageToFlutter("MODEL_LOADED:bundled");
         EnvironmentLight.Ensure();

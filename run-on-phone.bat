@@ -34,7 +34,7 @@ echo   First run can take 5-15 minutes. Leave this window open.
 echo ================================================
 echo.
 
-call flutter run --dart-define=API_URL=http://192.168.100.66:3000/graphql -d !DEVICE!
+call flutter run --dart-define=API_URL=http://192.168.100.66:3000/graphql -d "!DEVICE!"
 echo.
 echo Flutter exited.
 pause

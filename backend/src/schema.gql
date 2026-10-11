@@ -56,6 +56,15 @@ type UserConfigurationModel {
   assets: [AssetModel!]!
 }
 
+type LiveSegmentationModel {
+  masked: Boolean!
+  maskBase64: String
+  polishedBase64: String
+  paintPixels: Int!
+  source: String!
+  reason: String
+}
+
 type VehicleIdentificationModel {
   identified: Boolean!
   source: String!
@@ -70,6 +79,77 @@ type VehicleIdentificationModel {
   assets: [AssetModel!]!
 }
 
+type DamageRecordModel {
+  id: ID!
+  inspectionId: ID!
+  damageType: String!
+  severity: String!
+  confidence: Float!
+  affectedPanel: String!
+  areaPercentage: Float!
+  boundingBoxJson: String!
+  spatialAnchorJson: String
+  maskUrl: String
+  recommendedAction: String!
+  estimatedLaborHours: Float!
+  createdAt: DateTime!
+}
+
+type CostEstimateModel {
+  id: ID!
+  inspectionId: ID!
+  laborCost: Float!
+  paintMaterialCost: Float!
+  partsCost: Float!
+  subtotal: Float!
+  tax: Float!
+  total: Float!
+  currency: String!
+  priceBandMin: Float!
+  priceBandMax: Float!
+  createdAt: DateTime!
+}
+
+type InspectionModel {
+  id: ID!
+  userId: ID!
+  carId: ID
+  licensePlate: String
+  vin: String
+  make: String
+  model: String
+  year: Int
+  status: String!
+  imageUrl: String
+  damages: [DamageRecordModel!]!
+  estimate: CostEstimateModel
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type JobCardPartModel {
+  partId: ID!
+  partName: String!
+  quantity: Int!
+  unitPrice: Float!
+}
+
+type JobCardModel {
+  id: ID!
+  jobNumber: String!
+  inspectionId: ID!
+  userId: ID!
+  technicianName: String
+  status: String!
+  priority: String!
+  customerNotes: String
+  internalNotes: String
+  estimatedCompletionDate: DateTime
+  partsRequired: [JobCardPartModel!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
 type Query {
   cars: [CarModel!]!
   car(id: ID!): CarModel
@@ -77,6 +157,11 @@ type Query {
   assetsForCar(carId: ID!, type: String): [AssetModel!]!
   sharedConfiguration(token: String!): SharedConfigurationModel!
   myConfigurations: [UserConfigurationModel!]!
+  inspection(id: ID!): InspectionModel!
+  myInspections: [InspectionModel!]!
+  jobCard(id: ID!): JobCardModel!
+  myJobCards: [JobCardModel!]!
+  jobCards(status: String): [JobCardModel!]!
 }
 
 type Mutation {
@@ -85,6 +170,11 @@ type Mutation {
   saveConfiguration(input: SaveConfigurationInput!): UserConfigurationModel!
   shareConfiguration(id: ID!): UserConfigurationModel!
   identifyVehicle(input: IdentifyVehicleInput!): VehicleIdentificationModel!
+  segmentLiveCar(input: IdentifyVehicleInput!): LiveSegmentationModel!
+  startInspection(input: CreateInspectionInput!): InspectionModel!
+  recordDamageAssessment(input: RecordDamageAssessmentInput!): InspectionModel!
+  createJobCard(input: CreateJobCardInput!): JobCardModel!
+  updateJobCardStatus(input: UpdateJobCardStatusInput!): JobCardModel!
 }
 
 input LoginInput {
@@ -108,4 +198,59 @@ input SaveConfigurationInput {
 input IdentifyVehicleInput {
   imageBase64: String!
   mimeType: String
+  hexColor: String
+  finish: String
+  panel: String
+  repolishOnly: Boolean
+}
+
+input CreateInspectionInput {
+  carId: ID
+  licensePlate: String
+  vin: String
+  make: String
+  model: String
+  year: Int
+  imageUrl: String
+}
+
+input RecordDamageAssessmentInput {
+  inspectionId: ID!
+  damages: [DamageItemInput!]!
+}
+
+input DamageItemInput {
+  damageType: String!
+  severity: String!
+  confidence: Float! = 0.9
+  affectedPanel: String!
+  areaPercentage: Float! = 5
+  boundingBoxJson: String!
+  spatialAnchorJson: String
+  maskUrl: String
+  recommendedAction: String! = "REPAIR"
+  estimatedLaborHours: Float! = 1.5
+}
+
+input CreateJobCardInput {
+  inspectionId: ID!
+  technicianName: String
+  priority: String! = "NORMAL"
+  customerNotes: String
+  internalNotes: String
+  estimatedCompletionDate: DateTime
+  partsRequired: [JobCardPartInput!]! = []
+}
+
+input JobCardPartInput {
+  partId: ID!
+  quantity: Int! = 1
+  unitPrice: Float!
+}
+
+input UpdateJobCardStatusInput {
+  id: ID!
+  status: String!
+  technicianName: String
+  internalNotes: String
 }

@@ -11,8 +11,8 @@ async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     bodyParser: false,
   });
-  app.useBodyParser('json', { limit: '8mb' });
-  app.useBodyParser('urlencoded', { extended: true, limit: '8mb' });
+  app.useBodyParser('json', { limit: '20mb' });
+  app.useBodyParser('urlencoded', { extended: true, limit: '20mb' });
 
   // Dev only: the phone is a different origin on the LAN. Do not ship origin:true.
   app.enableCors({

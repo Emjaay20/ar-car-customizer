@@ -34,7 +34,10 @@ public class BuildCommand
         var summary = report.summary;
 
         if (summary.result == UnityEditor.Build.Reporting.BuildResult.Succeeded)
+        {
+            StripDuplicateLauncherFromManifest(exportPath);
             Debug.Log("Android Export Succeeded!");
+        }
         else
             Debug.LogError("Android Export Failed: " + summary.result);
 
@@ -42,6 +45,34 @@ public class BuildCommand
         // The menu item must leave the editor window open.
         if (Application.isBatchMode)
             EditorApplication.Exit(summary.result == UnityEditor.Build.Reporting.BuildResult.Succeeded ? 0 : 1);
+    }
+
+    static void StripDuplicateLauncherFromManifest(string exportPath)
+    {
+        string[] candidates =
+        {
+            Path.Combine(exportPath, "src", "main", "AndroidManifest.xml"),
+            Path.Combine(exportPath, "unityLibrary", "src", "main", "AndroidManifest.xml"),
+        };
+
+        foreach (var manifestPath in candidates)
+        {
+            if (!File.Exists(manifestPath)) continue;
+            var xml = File.ReadAllText(manifestPath);
+            xml = System.Text.RegularExpressions.Regex.Replace(
+                xml,
+                @"<intent-filter>\s*<category android:name=""android\.intent\.category\.LAUNCHER""\s*/>\s*<action android:name=""android\.intent\.action\.MAIN""\s*/>\s*</intent-filter>",
+                "",
+                System.Text.RegularExpressions.RegexOptions.Singleline);
+            xml = System.Text.RegularExpressions.Regex.Replace(
+                xml,
+                @"<intent-filter>\s*<action android:name=""android\.intent\.action\.MAIN""\s*/>\s*<category android:name=""android\.intent\.category\.LAUNCHER""\s*/>\s*</intent-filter>",
+                "",
+                System.Text.RegularExpressions.RegexOptions.Singleline);
+            xml = xml.Replace(@"android:exported=""true""", @"android:exported=""false""");
+            File.WriteAllText(manifestPath, xml);
+            Debug.Log("Cleaned duplicate launcher intent-filter from: " + manifestPath);
+        }
     }
 
     [MenuItem("Flutter/Export iOS for Flutter (iPhone)")]
