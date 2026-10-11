@@ -83,40 +83,80 @@ Shader "ARCar/LivePaint"
                 return side * smoothstep(0.20, 0.30, uv.y) * smoothstep(0.68, 0.56, uv.y);
             }
 
-            half3 ShadePaint(float mask, float3 scene, out float alphaScale)
+            half3 SampleBlurredPlate(float2 screenUV, float2 uv)
             {
+                half3 acc = half3(0, 0, 0);
+                float2 stepScreen = float2(0.0085, 0.0065);
+                [unroll]
+                for (int y = -2; y <= 2; y++)
+                {
+                    [unroll]
+                    for (int x = -2; x <= 2; x++)
+                    {
+                        float2 offset = float2(x, y) * stepScreen;
+                        float3 s1 = SampleSceneColor(saturate(screenUV + offset));
+                        float3 s2 = SAMPLE_TEXTURE2D(_SceneTex, sampler_SceneTex, saturate(uv + offset)).rgb;
+                        acc += max(s1, s2);
+                    }
+                }
+                return acc / 25.0;
+            }
+
+            half3 ShadePaint(float3 maskSample, float3 scene)
+            {
+                float mask = maskSample.r;
+                float intrinsicShade = maskSample.g;
+                float intrinsicSpec = maskSample.b;
+
                 float2 gradient = float2(ddx(mask), ddy(mask));
-                float3 normal = normalize(float3(-gradient * 5.0, 1.0));
+                float3 normal = normalize(float3(-gradient * 4.5, 1.0));
                 float3 lightDir = normalize(float3(0.35, 0.75, 0.60));
                 float ndotl = saturate(dot(normal, lightDir));
                 float3 halfDir = normalize(lightDir + float3(0, 0, 1));
-                float specPower = lerp(8.0, 88.0, _Smoothness);
+                float specPower = lerp(10.0, 96.0, _Smoothness);
                 float geomSpec = pow(saturate(dot(normal, halfDir)), specPower) * _Smoothness * _Smoothness;
 
                 float luma = dot(scene, float3(0.2126, 0.7152, 0.0722));
-                float energy = max(luma, max(scene.r, max(scene.g, scene.b)));
+                // High-frequency live camera crease/seam detail (ddx/ddy local contrast)
+                float lumaDx = ddx(luma);
+                float lumaDy = ddy(luma);
+                float microEdge = saturate(sqrt(lumaDx * lumaDx + lumaDy * lumaDy) * 3.5);
 
-                // Intrinsic-style shading curve so even dark/black cars take light colors (Super White, Silver, Candy Red)
-                // while preserving 3D hood creases and real clear-coat reflections
-                float bodyShade = energy > 0.015
-                    ? lerp(0.78, 1.14, smoothstep(0.02, 0.58, luma))
-                    : lerp(0.74, 1.06, ndotl);
+                // Combine car-normalized 3D shading from worker (maskSample.g) with live camera shading
+                // If an older monochrome mask is used (where R == G == B), fall back to normalized luma curve
+                bool hasIntrinsic = abs(maskSample.r - maskSample.g) > 0.015 || abs(maskSample.g - maskSample.b) > 0.015;
+                float normShade = hasIntrinsic ? intrinsicShade : smoothstep(0.08, 0.88, luma);
 
-                float realHighlight = energy > 0.015
-                    ? smoothstep(0.48, 0.86, luma) * _Smoothness
-                    : 0.0;
+                // Finish-aware base-coat shading curve matching studio_polish_car_paint:
+                // Deep, saturated midtones and dark creases so even bright white cars turn rich Candy Red / Gloss Black
+                float shadeMin = lerp(0.36, 0.22, _Smoothness);
+                float shadeSpan = lerp(0.54, 0.86, _Smoothness);
+                float paintLuma = dot(_Tint.rgb, float3(0.2126, 0.7152, 0.0722));
+                if (paintLuma > 0.70)
+                {
+                    shadeMin = 0.54;
+                    shadeSpan = 0.46;
+                }
+                else if (paintLuma < 0.12)
+                {
+                    shadeMin = 0.16;
+                    shadeSpan = 0.64;
+                }
 
-                // Protect intense white glare / headlights from heavy tinting
-                float cmax = max(scene.r, max(scene.g, scene.b));
-                float cmin = min(scene.r, min(scene.g, scene.b));
-                float sat = (cmax - cmin) / (cmax + 0.001);
-                float glareSuppress = smoothstep(0.76, 0.92, luma) * (1.0 - smoothstep(0.10, 0.32, sat));
-                alphaScale = 1.0 - 0.75 * glareSuppress;
+                float bodyShade = (shadeMin + shadeSpan * pow(saturate(normShade), 0.96)) * (1.0 - microEdge * 0.28);
+                bodyShade = lerp(bodyShade, bodyShade * lerp(0.88, 1.08, ndotl), 0.22);
 
-                half3 specColor = lerp(half3(1, 1, 1), _Tint.rgb * 0.7 + 0.3, _Metallic);
-                half3 diffuse = _Tint.rgb * bodyShade * (1.0 - _Metallic * 0.28);
-                half3 totalSpec = specColor * (geomSpec * 0.45 + realHighlight * 0.55);
-                return saturate(diffuse + totalSpec);
+                // Clear-coat specular highlight only on the top 35% of car-normalized reflections (never across the whole white body)
+                float specLayer = hasIntrinsic
+                    ? saturate(intrinsicSpec / 0.92)
+                    : pow(smoothstep(0.68, 0.96, normShade), 1.8);
+                float specStrength = _Smoothness * _Smoothness * lerp(0.38, 0.62, _Metallic);
+
+                half3 specColor = lerp(half3(1, 1, 1), _Tint.rgb * 0.55 + 0.45, saturate(_Metallic + (_Smoothness > 0.88 ? 0.35 : 0.0)));
+                half3 diffuse = _Tint.rgb * bodyShade * (1.0 - _Metallic * 0.18);
+                half3 totalSpec = specColor * (specLayer * specStrength + geomSpec * 0.22);
+                half3 envReflect = scene * (specLayer * _Smoothness * 0.16);
+                return saturate(diffuse + totalSpec + envReflect);
             }
 
             Varyings vert(Attributes input)
@@ -129,24 +169,29 @@ Shader "ARCar/LivePaint"
 
             half4 frag(Varyings input) : SV_Target
             {
-                float mask = SAMPLE_TEXTURE2D(_MaskTex, sampler_MaskTex, input.uv).r;
-                mask *= PanelGate(input.uv, _Panel);
+                float3 maskSample = SAMPLE_TEXTURE2D(_MaskTex, sampler_MaskTex, input.uv).rgb;
+                float2 screenUV = GetNormalizedScreenSpaceUV(input.positionHCS);
+
+                // Live License Plate Privacy Blur: worker encodes plate region as R=0, B=1
+                if (maskSample.r < 0.04 && maskSample.b > 0.82)
+                {
+                    half3 blurredPlate = SampleBlurredPlate(screenUV, input.uv);
+                    return half4(blurredPlate, 0.98);
+                }
+
+                float mask = maskSample.r * PanelGate(input.uv, _Panel);
                 if (mask < 0.02) discard;
 
-                float2 screenUV = GetNormalizedScreenSpaceUV(input.positionHCS);
                 float3 opaqueScene = SampleSceneColor(screenUV);
                 float3 camScene = SAMPLE_TEXTURE2D(_SceneTex, sampler_SceneTex, input.uv).rgb;
                 float3 scene = max(opaqueScene, camScene);
 
-                float alphaScale = 1.0;
-                half3 paintRgb = ShadePaint(mask, scene, alphaScale);
+                half3 paintRgb = ShadePaint(maskSample, scene);
 
-                // Smooth feather on mask boundaries, strong coverage on sheet metal interior
-                float smoothMask = smoothstep(0.08, 0.55, mask);
-                float paintLuma = dot(_Tint.rgb, float3(0.2126, 0.7152, 0.0722));
-                // Boost coverage slightly for bright paints (e.g., Super White on a black car)
-                float effectiveStrength = saturate(_Strength + paintLuma * 0.22);
-                float alpha = saturate(smoothMask * effectiveStrength * alphaScale);
+                // Crisp automotive edge feathering with full base-coat replacement on interior sheet metal
+                float smoothMask = smoothstep(0.06, 0.48, mask);
+                float effectiveStrength = saturate(max(_Strength, 0.94));
+                float alpha = saturate(smoothMask * effectiveStrength);
                 if (alpha < 0.004) discard;
 
                 return half4(paintRgb, alpha);
@@ -217,27 +262,37 @@ Shader "ARCar/LivePaint"
 
             fixed4 frag(v2f input) : SV_Target
             {
-                float mask = tex2D(_MaskTex, input.uv).r;
-                mask *= PanelGate(input.uv, _Panel);
+                float3 maskSample = tex2D(_MaskTex, input.uv).rgb;
+                if (maskSample.r < 0.04 && maskSample.b > 0.82)
+                {
+                    float3 blurAcc = 0;
+                    float2 stepUV = float2(0.008, 0.006);
+                    for (int y = -1; y <= 1; y++)
+                    {
+                        for (int x = -1; x <= 1; x++)
+                        {
+                            blurAcc += tex2D(_SceneTex, saturate(input.uv + float2(x, y) * stepUV)).rgb;
+                        }
+                    }
+                    return fixed4(blurAcc / 9.0, 0.98);
+                }
+
+                float mask = maskSample.r * PanelGate(input.uv, _Panel);
                 if (mask < 0.02) discard;
 
                 float3 scene = tex2D(_SceneTex, input.uv).rgb;
                 float luma = dot(scene, float3(0.2126, 0.7152, 0.0722));
-                float2 gradient = float2(ddx(mask), ddy(mask));
-                float3 normal = normalize(float3(-gradient * 5.0, 1.0));
-                float3 lightDir = normalize(float3(0.35, 0.75, 0.60));
-                float ndotl = saturate(dot(normal, lightDir));
-                float3 halfDir = normalize(lightDir + float3(0, 0, 1));
-                float spec = pow(saturate(dot(normal, halfDir)), lerp(8.0, 88.0, _Smoothness));
-                spec *= _Smoothness * _Smoothness;
+                bool hasIntrinsic = abs(maskSample.r - maskSample.g) > 0.015 || abs(maskSample.g - maskSample.b) > 0.015;
+                float normShade = hasIntrinsic ? maskSample.g : smoothstep(0.08, 0.88, luma);
+                float specLayer = hasIntrinsic ? saturate(maskSample.b / 0.92) : pow(smoothstep(0.68, 0.96, normShade), 1.8);
 
-                float bodyShade = luma > 0.015 ? lerp(0.78, 1.14, smoothstep(0.02, 0.58, luma)) : lerp(0.74, 1.06, ndotl);
-                fixed3 specColor = lerp(fixed3(1, 1, 1), _Tint.rgb, _Metallic);
-                fixed3 diffuse = _Tint.rgb * bodyShade * (1.0 - _Metallic * 0.28);
-                float smoothMask = smoothstep(0.08, 0.55, mask);
-                float alpha = saturate(smoothMask * _Strength);
+                float bodyShade = lerp(0.36, 0.24, _Smoothness) + lerp(0.54, 0.84, _Smoothness) * normShade;
+                fixed3 specColor = lerp(fixed3(1, 1, 1), _Tint.rgb * 0.55 + 0.45, _Metallic);
+                fixed3 diffuse = _Tint.rgb * bodyShade * (1.0 - _Metallic * 0.18);
+                float smoothMask = smoothstep(0.06, 0.48, mask);
+                float alpha = saturate(smoothMask * max(_Strength, 0.94));
                 if (alpha < 0.004) discard;
-                return fixed4(saturate(diffuse + specColor * spec * 0.55), alpha);
+                return fixed4(saturate(diffuse + specColor * specLayer * _Smoothness * 0.48), alpha);
             }
             ENDCG
         }

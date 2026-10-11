@@ -14,7 +14,7 @@ public class LiveCarFilter : MonoBehaviour
     bool maskApplied;
     float metallic = 0.08f;
     float smoothness = 0.92f;
-    float strength = 0.62f;
+    float strength = 0.95f;
     float panel;
 
     public static LiveCarFilter Ensure(Camera camera)

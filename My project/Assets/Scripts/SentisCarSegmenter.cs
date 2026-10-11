@@ -73,15 +73,15 @@ public class SentisCarSegmenter : MonoBehaviour
         float stillDuration = 0f;
         float lastTriggerTime = Time.unscaledTime;
 
-        const float pollInterval = 0.08f;
-        const float moveAngleThreshold = 2.8f;
-        const float moveDistThreshold = 0.045f;
-        const float largePanAngleThreshold = 8.5f;
-        const float largePanDistThreshold = 0.14f;
-        const float stillAngleDeltaMax = 0.9f;
-        const float stillDistDeltaMax = 0.015f;
-        const float settleHoldSeconds = 0.20f;
-        const float minCooldownSeconds = 0.55f;
+        const float pollInterval = 0.06f;
+        const float moveAngleThreshold = 1.8f;
+        const float moveDistThreshold = 0.03f;
+        const float largePanAngleThreshold = 3.2f;
+        const float largePanDistThreshold = 0.055f;
+        const float stillAngleDeltaMax = 0.85f;
+        const float stillDistDeltaMax = 0.014f;
+        const float settleHoldSeconds = 0.15f;
+        const float minCooldownSeconds = 0.38f;
 
         while (loopActive)
         {

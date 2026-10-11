@@ -38,7 +38,7 @@ backend/public/masks/
 __pycache__/
 *.py[cod]
 *$py.class
-ml/*.pt
+*.pt
 CarSegMask.onnx.data
 yolov8n-seg.onnx
 scratch/

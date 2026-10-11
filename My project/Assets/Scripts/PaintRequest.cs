@@ -71,15 +71,15 @@ public class PaintRequest
         switch (NormalizeFinish(finish))
         {
             case "matte":
-                return new PaintFinishValues(0f, 0.12f, 0.78f);
+                return new PaintFinishValues(0f, 0.12f, 0.96f);
             case "satin":
-                return new PaintFinishValues(0.04f, 0.42f, 0.70f);
+                return new PaintFinishValues(0.06f, 0.44f, 0.95f);
             case "metallic":
-                return new PaintFinishValues(0.92f, 0.72f, 0.66f);
+                return new PaintFinishValues(0.92f, 0.76f, 0.95f);
             case "candy":
-                return new PaintFinishValues(0.35f, 0.90f, 0.68f);
+                return new PaintFinishValues(0.42f, 0.92f, 0.96f);
             default:
-                return new PaintFinishValues(0.08f, 0.92f, 0.62f);
+                return new PaintFinishValues(0.10f, 0.90f, 0.95f);
         }
     }
 
