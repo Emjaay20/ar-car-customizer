@@ -2,8 +2,10 @@ using UnityEngine;
 using UnityEngine.Rendering.Universal;
 
 /// <summary>
-/// Screen-space tint. Invisible until a segmentation mask is supplied.
-/// The mask's red channel is the paint region; windows and tires should already be black.
+/// Screen-space car paint and locked showroom frame controller.
+/// - SEARCHING/CAPTURING: LiveCarPaint quad applies mask tint with Dichromatic shader.
+/// - LOCKED: ShowroomLockedFrame quad cross-fades into 960px polished composite, turning live shader OFF.
+///   Subtle micro-warp compensates for small head movements (1-3°); clamps warp on larger delta without dropping the image.
 /// </summary>
 public class LiveCarFilter : MonoBehaviour
 {
@@ -16,6 +18,17 @@ public class LiveCarFilter : MonoBehaviour
     float smoothness = 0.92f;
     float strength = 0.95f;
     float panel;
+
+    // Locked Showroom Full-Frame Quad
+    GameObject lockedQuad;
+    Material lockedMaterial;
+    bool isLocked = false;
+    Vector3 lockedCamPos;
+    Quaternion lockedCamRot;
+    float fadeAlpha = 0f;
+    float targetAlpha = 0f;
+
+    public bool IsLocked => isLocked;
 
     public static LiveCarFilter Ensure(Camera camera)
     {
@@ -39,14 +52,26 @@ public class LiveCarFilter : MonoBehaviour
         return quad.AddComponent<LiveCarFilter>();
     }
 
+    void Update()
+    {
+        if (lockedMaterial != null && Mathf.Abs(fadeAlpha - targetAlpha) > 0.005f)
+        {
+            fadeAlpha = Mathf.MoveTowards(fadeAlpha, targetAlpha, Time.unscaledDeltaTime * 5.0f);
+            lockedMaterial.SetFloat("_Alpha", fadeAlpha);
+            if (fadeAlpha <= 0.005f && targetAlpha == 0f)
+            {
+                isLocked = false;
+                if (lockedQuad != null) lockedQuad.SetActive(false);
+                ApplyFinish();
+            }
+        }
+    }
+
     void LateUpdate()
     {
         var camera = GetComponentInParent<Camera>();
         if (camera == null) return;
 
-        // ARCore overrides camera.projectionMatrix directly without updating camera.fieldOfView.
-        // Compute exact quad dimensions and principal-point offset from projectionMatrix so UV [0..1]
-        // maps 1:1 to the camera viewport corners (-1..+1 NDC).
         var proj = camera.projectionMatrix;
         float m00 = Mathf.Abs(proj.m00) > 1e-4f ? proj.m00 : (1f / (Mathf.Tan(camera.fieldOfView * 0.5f * Mathf.Deg2Rad) * camera.aspect));
         float m11 = Mathf.Abs(proj.m11) > 1e-4f ? proj.m11 : (1f / Mathf.Tan(camera.fieldOfView * 0.5f * Mathf.Deg2Rad));
@@ -58,6 +83,115 @@ public class LiveCarFilter : MonoBehaviour
         transform.localPosition = new Vector3(offsetX, offsetY, Distance);
         transform.localRotation = Quaternion.identity;
         transform.localScale = new Vector3(width, height, 1f);
+
+        if (lockedQuad != null && lockedQuad.activeSelf)
+        {
+            float lDistance = Distance - 0.005f;
+            float lWidth = (2f * lDistance) / Mathf.Abs(m00);
+            float lHeight = (2f * lDistance) / Mathf.Abs(m11);
+            float lOffsetX = (proj.m02 * lDistance) / m00;
+            float lOffsetY = (proj.m12 * lDistance) / m11;
+            lockedQuad.transform.localScale = new Vector3(lWidth, lHeight, 1f);
+
+            if (isLocked)
+            {
+                float angleDelta = Quaternion.Angle(camera.transform.rotation, lockedCamRot);
+                float distDelta = Vector3.Distance(camera.transform.position, lockedCamPos);
+                if (angleDelta < 4.0f && distDelta < 0.15f)
+                {
+                    // Small head motion compensation (micro-warp)
+                    Quaternion deltaRot = Quaternion.Inverse(camera.transform.rotation) * lockedCamRot;
+                    Vector3 deltaPos = camera.transform.InverseTransformDirection(lockedCamPos - camera.transform.position);
+                    lockedQuad.transform.localRotation = Quaternion.Slerp(Quaternion.identity, deltaRot, 0.70f);
+                    lockedQuad.transform.localPosition = new Vector3(lOffsetX, lOffsetY, lDistance) + deltaPos * 0.12f;
+                }
+                else
+                {
+                    // Delta exceeded: release warp, clamp camera-aligned, hold image without rubber-sheeting
+                    lockedQuad.transform.localRotation = Quaternion.identity;
+                    lockedQuad.transform.localPosition = new Vector3(lOffsetX, lOffsetY, lDistance);
+                }
+            }
+            else
+            {
+                lockedQuad.transform.localRotation = Quaternion.identity;
+                lockedQuad.transform.localPosition = new Vector3(lOffsetX, lOffsetY, lDistance);
+            }
+        }
+    }
+
+    public void SetLockedFrame(Texture2D frameTex, bool instant = false)
+    {
+        EnsureLockedQuad();
+        if (lockedMaterial != null && frameTex != null)
+        {
+            lockedMaterial.SetTexture("_MainTex", frameTex);
+        }
+
+        var camera = GetComponentInParent<Camera>();
+        if (camera != null)
+        {
+            lockedCamPos = camera.transform.position;
+            lockedCamRot = camera.transform.rotation;
+        }
+
+        isLocked = true;
+        if (lockedQuad != null)
+            lockedQuad.SetActive(true);
+
+        if (instant)
+        {
+            fadeAlpha = 1f;
+            targetAlpha = 1f;
+            if (lockedMaterial != null) lockedMaterial.SetFloat("_Alpha", 1f);
+        }
+        else
+        {
+            targetAlpha = 1f;
+        }
+
+        // Live shader OFF while locked to prevent double-paint sunglass look
+        ApplyFinish();
+    }
+
+    public void ReleaseLockedFrame()
+    {
+        targetAlpha = 0f;
+    }
+
+    void EnsureLockedQuad()
+    {
+        if (lockedQuad != null && lockedMaterial != null) return;
+
+        var camera = GetComponentInParent<Camera>();
+        if (camera == null) return;
+
+        var existing = camera.transform.Find("ShowroomLockedFrame");
+        if (existing != null)
+        {
+            lockedQuad = existing.gameObject;
+        }
+        else
+        {
+            lockedQuad = GameObject.CreatePrimitive(PrimitiveType.Quad);
+            lockedQuad.name = "ShowroomLockedFrame";
+            var collider = lockedQuad.GetComponent<Collider>();
+            if (collider != null) Destroy(collider);
+            lockedQuad.transform.SetParent(camera.transform, false);
+        }
+
+        if (lockedMaterial == null)
+        {
+            var shader = Shader.Find("ARCar/ShowroomFrame");
+            if (shader == null) shader = Shader.Find("Universal Render Pipeline/Unlit");
+            if (shader == null) shader = Shader.Find("Unlit/Texture");
+            lockedMaterial = new Material(shader) { name = "ShowroomFrameMat" };
+            lockedMaterial.SetFloat("_Alpha", fadeAlpha);
+        }
+
+        var renderer = lockedQuad.GetComponent<Renderer>();
+        if (renderer != null)
+            renderer.sharedMaterial = lockedMaterial;
     }
 
     public bool SetTint(Color color)
@@ -99,7 +233,8 @@ public class LiveCarFilter : MonoBehaviour
         material.SetFloat("_Metallic", metallic);
         material.SetFloat("_Smoothness", smoothness);
         material.SetFloat("_Panel", panel);
-        material.SetFloat("_Strength", maskApplied ? strength : 0f);
+        // Live shader OFF while showroom full frame is locked
+        material.SetFloat("_Strength", (maskApplied && !isLocked) ? strength : 0f);
     }
 
     bool EnsureMaterial()

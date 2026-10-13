@@ -23,6 +23,8 @@ export class VisionResolver {
       finish: input.finish,
       panel: input.panel,
       repolishOnly: input.repolishOnly,
+      frameId: input.frameId,
+      hdMode: input.hdMode,
     });
   }
 }

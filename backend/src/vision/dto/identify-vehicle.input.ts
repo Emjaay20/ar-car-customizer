@@ -19,4 +19,10 @@ export class IdentifyVehicleInput {
 
   @Field({ nullable: true })
   repolishOnly?: boolean;
+
+  @Field({ nullable: true })
+  frameId?: string;
+
+  @Field({ nullable: true })
+  hdMode?: boolean;
 }

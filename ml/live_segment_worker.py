@@ -23,11 +23,29 @@ DEFAULT_MODEL = "yolov8s-seg.pt" if (Path(__file__).resolve().parent / "yolov8s-
 MODEL_PATH = Path(__file__).resolve().parent / os.environ.get("YOLO_SEG_MODEL", DEFAULT_MODEL)
 PUBLISH_DIR = ROOT / "backend" / "public" / "masks"
 
-# Cached clean frame & mask in memory for instant (<20ms) re-polishing when user taps different swatches/finishes
-LAST_CLEAN_BGR: np.ndarray | None = None
-LAST_MASK_U8: np.ndarray | None = None
-LAST_PLATE_BOOL: np.ndarray | None = None
-LAST_SOURCE: str = "yolov8s-seg"
+# Client-owned frame cache keyed by frameId for deterministic, jump-free <20ms repolishing
+FRAME_CACHE: dict[str, dict] = {}
+MAX_FRAME_CACHE = 12
+
+def cache_put_frame(frame_id: str, work_bgr: np.ndarray, paint_u8: np.ndarray, plate_bool: np.ndarray, source: str) -> None:
+    if len(FRAME_CACHE) >= MAX_FRAME_CACHE:
+        oldest_id = min(FRAME_CACHE.keys(), key=lambda k: FRAME_CACHE[k].get("ts", 0))
+        FRAME_CACHE.pop(oldest_id, None)
+    FRAME_CACHE[frame_id] = {
+        "bgr": work_bgr.copy(),
+        "mask_u8": paint_u8.copy(),
+        "plate": plate_bool.copy() if plate_bool is not None else np.zeros(paint_u8.shape[:2], dtype=bool),
+        "source": source,
+        "ts": time.time(),
+    }
+
+def cache_get_frame(frame_id: str | None) -> dict | None:
+    if frame_id and frame_id in FRAME_CACHE:
+        return FRAME_CACHE[frame_id]
+    if FRAME_CACHE:
+        newest_id = max(FRAME_CACHE.keys(), key=lambda k: FRAME_CACHE[k].get("ts", 0))
+        return FRAME_CACHE[newest_id]
+    return None
 
 
 def load_model() -> YOLO:
@@ -886,15 +904,19 @@ def process_frame(
     panel: str = "body",
     repolish_only: bool = False,
     hd_mode: bool = False,
+    frame_id: str = "",
 ) -> dict:
-    global LAST_CLEAN_BGR, LAST_MASK_U8, LAST_PLATE_BOOL, LAST_SOURCE
-
-    if repolish_only and (not hd_mode) and LAST_CLEAN_BGR is not None and LAST_MASK_U8 is not None:
-        work_bgr = LAST_CLEAN_BGR
-        paint_u8 = LAST_MASK_U8
-        plate_bool = LAST_PLATE_BOOL
-        source = LAST_SOURCE
-        work_h, work_w = paint_u8.shape[:2]
+    if repolish_only:
+        cached = cache_get_frame(frame_id)
+        if cached is not None:
+            work_bgr = cached["bgr"]
+            paint_u8 = cached["mask_u8"]
+            plate_bool = cached["plate"]
+            source = cached["source"]
+            work_h, work_w = paint_u8.shape[:2]
+            effective_frame_id = frame_id if (frame_id and frame_id in FRAME_CACHE) else "cached_latest"
+        else:
+            return {"ok": False, "reason": "No frame in cache to repolish"}
     else:
         raw = base64.b64decode(image_b64)
         arr = np.frombuffer(raw, dtype=np.uint8)
@@ -925,25 +947,23 @@ def process_frame(
         source = "yolov8s-seg-hd" if hd_mode else "yolov8s-seg"
         paint_u8, plate_bool = build_paint_mask(work_bgr, primary_mask, return_plate=True)
 
-        # Multi-frame temporal consensus: when camera is settled on the same vehicle (IoU >= 0.82),
-        # blend with previous mask to eliminate single-frame flicker or boundary jitter
-        if (not hd_mode) and LAST_MASK_U8 is not None and LAST_MASK_U8.shape == paint_u8.shape:
+        # Multi-frame temporal consensus against previous cached frame when IoU >= 0.82
+        prev_cached = cache_get_frame(None)
+        if (not hd_mode) and prev_cached is not None and prev_cached["mask_u8"].shape == paint_u8.shape:
             curr_b = paint_u8 > 64
-            prev_b = LAST_MASK_U8 > 64
+            prev_b = prev_cached["mask_u8"] > 64
             inter = int(np.count_nonzero(curr_b & prev_b))
             union = int(np.count_nonzero(curr_b | prev_b))
             if union > 0 and (inter / float(union)) >= 0.82:
                 paint_u8 = np.clip(
-                    0.75 * paint_u8.astype(np.float32) + 0.25 * LAST_MASK_U8.astype(np.float32),
+                    0.75 * paint_u8.astype(np.float32) + 0.25 * prev_cached["mask_u8"].astype(np.float32),
                     0,
                     255,
                 ).astype(np.uint8)
                 paint_u8[plate_bool] = 0
 
-        LAST_CLEAN_BGR = work_bgr.copy()
-        LAST_MASK_U8 = paint_u8.copy()
-        LAST_PLATE_BOOL = plate_bool.copy()
-        LAST_SOURCE = source
+        effective_frame_id = frame_id if frame_id else f"frame_{int(time.time() * 1000)}"
+        cache_put_frame(effective_frame_id, work_bgr, paint_u8, plate_bool, source)
 
     polished_bgr = studio_polish_car_paint(
         work_bgr,
@@ -972,6 +992,7 @@ def process_frame(
 
     return {
         "ok": True,
+        "frameId": effective_frame_id,
         "maskBase64": base64.b64encode(png_bytes).decode("ascii"),
         "polishedBase64": base64.b64encode(pol_bytes).decode("ascii"),
         "width": work_w,
@@ -1092,6 +1113,7 @@ def main() -> int:
                 panel = payload.get("panel", "body")
                 repolish_only = bool(payload.get("repolishOnly", False))
                 hd_mode = bool(payload.get("hdMode", False)) or (mode == "hd_polish")
+                frame_id = str(payload.get("frameId", "") or "").strip()
                 res = process_frame(
                     model,
                     image_b64,
@@ -1100,6 +1122,7 @@ def main() -> int:
                     panel=panel,
                     repolish_only=repolish_only,
                     hd_mode=hd_mode,
+                    frame_id=frame_id,
                 )
             res["id"] = req_id
         except Exception as exc:

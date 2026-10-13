@@ -167,7 +167,14 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
   async segmentLiveCar(
     imageBase64: string,
     mimeType?: string,
-    options?: { hexColor?: string; finish?: string; panel?: string; repolishOnly?: boolean },
+    options?: {
+      hexColor?: string;
+      finish?: string;
+      panel?: string;
+      repolishOnly?: boolean;
+      frameId?: string;
+      hdMode?: boolean;
+    },
   ): Promise<LiveSegmentationModel> {
     const repolishOnly = Boolean(options?.repolishOnly);
     let base64Payload = '';
@@ -193,14 +200,17 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
       finish: options?.finish ?? 'gloss',
       panel: options?.panel ?? 'body',
       repolishOnly,
+      frameId: options?.frameId,
+      hdMode: Boolean(options?.hdMode),
     });
     const elapsedMs = Date.now() - t0;
 
     if (msg.ok && typeof msg.maskBase64 === 'string') {
       const paintPixels = Number(msg.paintPixels ?? 0);
       const source = String(msg.source ?? 'yolov8s-seg');
+      const returnedFrameId = typeof msg.frameId === 'string' ? msg.frameId : options?.frameId;
       console.log(
-        `[VisionService] segmentLiveCar ok=true source=${source} paintPixels=${paintPixels} color=${options?.hexColor ?? '#9B1B30'} finish=${options?.finish ?? 'gloss'} panel=${options?.panel ?? 'body'} repolish=${repolishOnly} (${elapsedMs}ms)`,
+        `[VisionService] segmentLiveCar ok=true source=${source} paintPixels=${paintPixels} color=${options?.hexColor ?? '#9B1B30'} finish=${options?.finish ?? 'gloss'} panel=${options?.panel ?? 'body'} repolish=${repolishOnly} frameId=${returnedFrameId ?? 'none'} (${elapsedMs}ms)`,
       );
       return {
         masked: true,
@@ -208,6 +218,7 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
         polishedBase64: typeof msg.polishedBase64 === 'string' ? msg.polishedBase64 : undefined,
         paintPixels,
         source,
+        frameId: returnedFrameId,
       };
     }
 

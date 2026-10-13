@@ -25,6 +25,7 @@ public class ShaderBuildKeeper : IPreprocessBuildWithReport
         "ARCar/BlobShadow",
         "ARCar/PhotoPaint",
         "ARCar/PhotoGlass",
+        "ARCar/ShowroomFrame",
     };
 
     public void OnPreprocessBuild(BuildReport report)

@@ -138,6 +138,25 @@ class UnityCommands {
     );
   }
 
+  static const loadLockedFrameMethod = 'LoadLockedFrame';
+  static const releaseLockedFrameMethod = 'ReleaseLockedFrame';
+
+  static UnityCommand loadLockedFrame(String url) {
+    return UnityCommand(
+      gameObject: gameObject,
+      method: loadLockedFrameMethod,
+      argument: url,
+    );
+  }
+
+  static UnityCommand releaseLockedFrame() {
+    return const UnityCommand(
+      gameObject: gameObject,
+      method: releaseLockedFrameMethod,
+      argument: '',
+    );
+  }
+
   static String partUrl(String materialBundleUrl, {String? apiUrl}) {
     return GraphQLService.resolveUrl(materialBundleUrl, apiUrl: apiUrl);
   }

@@ -165,6 +165,20 @@ public class FlutterMessageReceiver : MonoBehaviour
         StartCoroutine(LoadMaskRoutine(url));
     }
 
+    public void LoadLockedFrame(string url)
+    {
+        StartCoroutine(LoadLockedFrameRoutine(url));
+    }
+
+    public void ReleaseLockedFrame(string unused)
+    {
+        var camera = Camera.main;
+        var filter = LiveCarFilter.Ensure(camera);
+        if (filter != null)
+            filter.ReleaseLockedFrame();
+        SendMessageToFlutter("LOCKED_FRAME_RELEASED");
+    }
+
     public void SetKeypoints(string json)
     {
         var frame = JsonUtility.FromJson<KeypointFrame>(json);
@@ -290,6 +304,77 @@ public class FlutterMessageReceiver : MonoBehaviour
 
             SendMessageToFlutter("MASK_APPLIED");
         }
+    }
+
+    Texture2D lastLockedTexture;
+
+    System.Collections.IEnumerator LoadLockedFrameRoutine(string url)
+    {
+        if (string.IsNullOrEmpty(url))
+        {
+            SendMessageToFlutter("LOCKED_FRAME_FAILED:missing-url");
+            yield break;
+        }
+
+        byte[] bytes = null;
+        if (TryLocalPath(url, out var localPath))
+        {
+            try
+            {
+                bytes = File.ReadAllBytes(localPath);
+            }
+            catch (Exception e)
+            {
+                SendMessageToFlutter("LOCKED_FRAME_FAILED:" + e.Message);
+                yield break;
+            }
+        }
+        else
+        {
+            using (var request = UnityWebRequestTexture.GetTexture(ToRequestUrl(url)))
+            {
+                yield return request.SendWebRequest();
+                if (request.result != UnityWebRequest.Result.Success)
+                {
+                    SendMessageToFlutter("LOCKED_FRAME_FAILED:" + request.error);
+                    yield break;
+                }
+
+                var texture = DownloadHandlerTexture.GetContent(request);
+                if (!ApplyLockedFrameTexture(texture))
+                {
+                    SendMessageToFlutter("LOCKED_FRAME_FAILED:no-camera");
+                    yield break;
+                }
+
+                SendMessageToFlutter("LOCKED_FRAME_APPLIED");
+                yield break;
+            }
+        }
+
+        if (bytes != null)
+        {
+            var texture = new Texture2D(2, 2, TextureFormat.RGB24, false);
+            if (!texture.LoadImage(bytes) || !ApplyLockedFrameTexture(texture))
+            {
+                SendMessageToFlutter("LOCKED_FRAME_FAILED:bad-image");
+                yield break;
+            }
+
+            SendMessageToFlutter("LOCKED_FRAME_APPLIED");
+        }
+    }
+
+    bool ApplyLockedFrameTexture(Texture2D texture)
+    {
+        var camera = Camera.main;
+        var filter = LiveCarFilter.Ensure(camera);
+        if (filter == null) return false;
+        filter.SetLockedFrame(texture);
+        if (lastLockedTexture != null && lastLockedTexture != texture)
+            Destroy(lastLockedTexture);
+        lastLockedTexture = texture;
+        return true;
     }
 
     Texture2D lastMaskTexture;

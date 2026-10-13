@@ -14,6 +14,8 @@ import '../services/auth_session.dart';
 import '../services/paint_spec.dart';
 import '../services/unity_commands.dart';
 
+enum ArLockState { searching, capturing, locked, updating, released }
+
 class CustomizationScreen extends StatefulWidget {
   final Car car;
   final bool isUniversalMode;
@@ -34,7 +36,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   final Map<String, Asset> _selected = {};
   List<Asset> _catalogAssets = const [];
   UnityWidgetController? _unityController;
-  String? _unityStatus = 'Starting on-device live car filter…';
+  String? _unityStatus = 'Hold steady to lock preview';
   String? _savedConfigId;
   String? _customVehicleTitle;
   bool _saving = false;
@@ -44,6 +46,9 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   bool _maskingBusy = false;
   bool _hasActiveMask = false;
   bool _sentisLiveActive = false;
+  ArLockState _lockState = ArLockState.searching;
+  String? _lockedFrameId;
+  Uint8List? _lastGoodPolishedBytes;
   String _finish = 'gloss';
   String _panel = 'body';
   String? _paintColor = '#9B1B30';
@@ -104,6 +109,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
         paintPixels
         source
         reason
+        frameId
       }
     }
   ''';
@@ -116,10 +122,10 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   Timer? _autoMaskTimer;
 
   void _ensureAutoMaskTimer() {
-    _autoMaskTimer ??= Timer.periodic(const Duration(milliseconds: 2200), (_) {
+    _autoMaskTimer ??= Timer.periodic(const Duration(milliseconds: 2600), (_) {
       if (!mounted) return;
-      if (_sentisLiveActive && !_hasActiveMask && !_maskingBusy && !_sharingPhoto) {
-        _refineMaskWithBackend(silent: true);
+      if (_sentisLiveActive && _lockState == ArLockState.searching && !_maskingBusy && !_sharingPhoto) {
+        _captureAndLockPreview(silent: true);
       }
     });
   }
@@ -128,57 +134,109 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     if (_unityController == null) return;
     setState(() {
       _sentisLiveActive = true;
-      _unityStatus = 'Live filter active · Locking onto car sheet metal…';
+      _lockState = ArLockState.searching;
+      _unityStatus = 'Hold steady to lock preview';
     });
     _applyCurrentPaint();
     _post(UnityCommands.runSentis(stop: false));
     _ensureAutoMaskTimer();
-    _refineMaskWithBackend(silent: true);
+    _captureAndLockPreview(silent: true);
   }
 
   Future<void> _pauseLiveFilter() async {
     _autoMaskTimer?.cancel();
     _autoMaskTimer = null;
     if (!mounted) return;
+    _releaseLock();
     setState(() {
       _sentisLiveActive = false;
       _hasActiveMask = false;
       _maskingBusy = false;
       _capturingForMask = false;
+      _lockState = ArLockState.searching;
       _unityStatus = 'Live filter paused · Showing untouched camera feed.';
     });
     _post(UnityCommands.runSentis(stop: true));
   }
 
-  Future<void> _refineMaskWithBackend({bool silent = false}) async {
+  Future<void> _captureAndLockPreview({bool silent = false, bool isUpdate = false}) async {
     if (_unityController == null || _maskingBusy || _sharingPhoto) return;
     setState(() {
       _maskingBusy = true;
       _capturingForMask = true;
       _capturingForStudioShare = false;
-      _pendingHdPreview = !silent;
-      if (!silent || !_hasActiveMask) {
-        _unityStatus = !silent
-            ? 'Rendering Showroom HD Cut & locking precision mask…'
-            : 'Locking live paint mask onto car body…';
-      }
+      _lockState = isUpdate ? ArLockState.updating : ArLockState.capturing;
+      _unityStatus = isUpdate ? 'Updating preview angle…' : 'Locking showroom preview…';
     });
 
     _post(UnityCommands.captureSnapshot(clean: true));
-    Future<void>.delayed(const Duration(seconds: 5), () {
+    Future<void>.delayed(const Duration(seconds: 6), () {
       if (!mounted || !_capturingForMask) return;
       setState(() {
         _capturingForMask = false;
         _maskingBusy = false;
-        _pendingHdPreview = false;
-        if (!silent) {
-          _unityStatus = 'Camera frame capture timed out.';
+        if (_lastGoodPolishedBytes != null) {
+          _lockState = ArLockState.locked;
+          _unityStatus = 'Preview locked · Tap Update view when ready';
+        } else {
+          _lockState = ArLockState.searching;
+          _unityStatus = 'Hold steady to lock preview';
         }
       });
     });
   }
 
-  bool _pendingHdPreview = false;
+  Future<void> _repolishLockedFrame() async {
+    final frameId = _lockedFrameId;
+    if (frameId == null || _maskingBusy) return;
+    try {
+      final client = GraphQLProvider.of(context).value;
+      final result = await client.mutate(
+        MutationOptions(
+          document: gql(segmentLiveCarMutation),
+          fetchPolicy: FetchPolicy.noCache,
+          variables: {
+            'input': {
+              'imageBase64': '',
+              'hexColor': _paintColor ?? '#9B1B30',
+              'finish': _finish,
+              'panel': _panel,
+              'repolishOnly': true,
+              'frameId': frameId,
+              'hdMode': true,
+            },
+          },
+        ),
+      );
+      final data = result.data?['segmentLiveCar'] as Map<String, dynamic>?;
+      final polB64 = data?['polishedBase64'] as String?;
+      if (polB64 != null && polB64.isNotEmpty && mounted) {
+        final bytes = base64Decode(polB64);
+        _lastGoodPolishedBytes = bytes;
+        final tempFile = File('${Directory.systemTemp.path}/arcar-locked-frame.jpg');
+        await tempFile.writeAsBytes(bytes, flush: true);
+        if (mounted) {
+          _post(UnityCommands.loadLockedFrame(tempFile.path));
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _releaseLock() {
+    _post(UnityCommands.releaseLockedFrame());
+    setState(() {
+      _lockState = ArLockState.released;
+      _lockedFrameId = null;
+      _lastGoodPolishedBytes = null;
+      _hasActiveMask = false;
+      _unityStatus = 'Hold steady to lock preview';
+    });
+    Future<void>.delayed(const Duration(milliseconds: 250), () {
+      if (mounted && _lockState == ArLockState.released) {
+        setState(() => _lockState = ArLockState.searching);
+      }
+    });
+  }
 
   void _showHdShowroomSheet(Uint8List polishedBytes) {
     final paintName = _selected['PAINT']?.name ?? 'Custom Paint';
@@ -268,15 +326,20 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   }
 
   Future<void> _processLiveMaskSnapshot(String path) async {
-    final showHdSheet = _pendingHdPreview;
-    _pendingHdPreview = false;
     try {
       final file = File(path);
       if (!await file.exists()) {
         if (!mounted) return;
         setState(() {
           _maskingBusy = false;
-          _unityStatus = 'Could not read camera frame.';
+          _capturingForMask = false;
+          if (_lastGoodPolishedBytes != null) {
+            _lockState = ArLockState.locked;
+            _unityStatus = 'Preview locked · Tap Update view when ready';
+          } else {
+            _lockState = ArLockState.searching;
+            _unityStatus = 'Hold steady to lock preview';
+          }
         });
         return;
       }
@@ -287,9 +350,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       } catch (_) {}
 
       if (!mounted || !_sentisLiveActive) {
-        if (mounted) {
-          setState(() => _maskingBusy = false);
-        }
+        if (mounted) setState(() => _maskingBusy = false);
         return;
       }
       final client = GraphQLProvider.of(context).value;
@@ -305,57 +366,77 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
               'finish': _finish,
               'panel': _panel,
               'repolishOnly': false,
+              'hdMode': true,
             },
           },
         ),
       );
 
       if (!mounted || !_sentisLiveActive) {
-        if (mounted) {
-          setState(() => _maskingBusy = false);
-        }
+        if (mounted) setState(() => _maskingBusy = false);
         return;
       }
       final data = result.data?['segmentLiveCar'] as Map<String, dynamic>?;
-      if (result.hasException || data == null || data['masked'] != true || data['maskBase64'] == null) {
+      if (result.hasException || data == null || data['masked'] != true || data['polishedBase64'] == null) {
         final gqlErr = result.exception?.graphqlErrors.isNotEmpty == true
             ? result.exception!.graphqlErrors.first.message
             : result.exception?.linkException?.toString();
         final reason = data?['reason']?.toString() ??
-            (gqlErr != null ? 'Mask server busy — retrying automatically…' : 'Point camera at the car — auto-locking mask…');
+            (gqlErr != null ? 'Server busy · Retrying…' : 'Hold steady to lock preview');
         setState(() {
           _maskingBusy = false;
-          _unityStatus = reason;
+          _capturingForMask = false;
+          if (_lastGoodPolishedBytes != null) {
+            _lockState = ArLockState.locked;
+            _unityStatus = 'Preview locked · Kept previous angle';
+          } else {
+            _lockState = ArLockState.searching;
+            _unityStatus = reason;
+          }
         });
         return;
       }
 
-      final maskBytes = base64Decode(data['maskBase64'] as String);
-      _maskSlot = (_maskSlot + 1) % 2;
-      final maskFile = File(
-        '${Directory.systemTemp.path}/arcar-live-mask-$_maskSlot.png',
-      );
-      await maskFile.writeAsBytes(maskBytes, flush: true);
+      final polishedB64 = data['polishedBase64'] as String;
+      final polishedBytes = base64Decode(polishedB64);
+      _lastGoodPolishedBytes = polishedBytes;
+      _lockedFrameId = data['frameId'] as String?;
+
+      final lockedFrameFile = File('${Directory.systemTemp.path}/arcar-locked-frame.jpg');
+      await lockedFrameFile.writeAsBytes(polishedBytes, flush: true);
+
+      if (data['maskBase64'] != null) {
+        final maskBytes = base64Decode(data['maskBase64'] as String);
+        _maskSlot = (_maskSlot + 1) % 2;
+        final maskFile = File('${Directory.systemTemp.path}/arcar-live-mask-$_maskSlot.png');
+        await maskFile.writeAsBytes(maskBytes, flush: true);
+        _post(UnityCommands.loadMask(maskFile.path));
+      }
 
       if (!mounted || !_sentisLiveActive) return;
-      _post(UnityCommands.loadMask(maskFile.path));
+
+      _post(UnityCommands.loadLockedFrame(lockedFrameFile.path));
       _applyCurrentPaint();
 
       setState(() {
         _maskingBusy = false;
+        _capturingForMask = false;
         _hasActiveMask = true;
-        _unityStatus = 'Live car filter active · Tap any color or finish below';
+        _lockState = ArLockState.locked;
+        _unityStatus = 'Preview locked';
       });
-
-      final polishedB64 = data['polishedBase64'] as String?;
-      if (showHdSheet && polishedB64 != null && polishedB64.isNotEmpty && mounted) {
-        _showHdShowroomSheet(base64Decode(polishedB64));
-      }
     } catch (error) {
       if (!mounted) return;
       setState(() {
         _maskingBusy = false;
-        _unityStatus = 'Masking error: $error';
+        _capturingForMask = false;
+        if (_lastGoodPolishedBytes != null) {
+          _lockState = ArLockState.locked;
+          _unityStatus = 'Preview locked · Kept previous angle';
+        } else {
+          _lockState = ArLockState.searching;
+          _unityStatus = 'Hold steady to lock preview';
+        }
       });
     }
   }
@@ -466,7 +547,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       if (!_sentisLiveActive) {
         _startLiveFilter();
       } else if (!_hasActiveMask && !_maskingBusy) {
-        _refineMaskWithBackend(silent: true);
+        _captureAndLockPreview(silent: true);
       }
       return;
     }
@@ -491,6 +572,9 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     final color = _paintColor;
     if (color == null || color.isEmpty) return;
     _sendPaint(color: color, finish: _finish, panel: _panel);
+    if (_lockState == ArLockState.locked && _lockedFrameId != null) {
+      _repolishLockedFrame();
+    }
   }
 
   void _applyHex() {
@@ -508,7 +592,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     if (!_sentisLiveActive) {
       _startLiveFilter();
     } else if (!_hasActiveMask && !_maskingBusy) {
-      _refineMaskWithBackend(silent: true);
+      _captureAndLockPreview(silent: true);
     }
   }
 
@@ -729,8 +813,8 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
         text.startsWith('CAMERA_SETTLED') ||
         text.startsWith('SENTIS_UNAVAILABLE') ||
         text.startsWith('SENTIS_NO_MODEL')) {
-      if (_sentisLiveActive && !_maskingBusy && !_sharingPhoto) {
-        _refineMaskWithBackend(silent: true);
+      if (_sentisLiveActive && !_maskingBusy && !_sharingPhoto && _lockState == ArLockState.searching) {
+        _captureAndLockPreview(silent: true);
       }
       return;
     }
@@ -843,6 +927,20 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
         title: Text(_displayVehicleTitle, style: const TextStyle(fontSize: 16)),
         actions: [
           IconButton(
+            tooltip: _sentisLiveActive ? 'Pause AR Studio' : 'Start AR Studio',
+            icon: Icon(
+              _sentisLiveActive ? Icons.videocam : Icons.videocam_off,
+              color: _sentisLiveActive ? const Color(0xFF00E5FF) : Colors.white54,
+            ),
+            onPressed: () {
+              if (_sentisLiveActive) {
+                _pauseLiveFilter();
+              } else {
+                _startLiveFilter();
+              }
+            },
+          ),
+          IconButton(
             tooltip: 'Hands-Free Voice Controls',
             icon: const Icon(Icons.mic, color: Color(0xFF00E5FF)),
             onPressed: _showVoiceCommandDialog,
@@ -926,55 +1024,81 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                       ),
                     ),
                   ),
-                // Bottom live camera filter controls
+                // Bottom live AR showroom controls
                 Positioned(
                   bottom: 10,
                   left: 12,
                   right: 12,
                   child: Row(
                     children: [
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: _sentisLiveActive
-                                ? const Color(0xFF00E5FF)
-                                : const Color(0xFF161B22),
-                            foregroundColor: _sentisLiveActive ? Colors.black : Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 10),
-                          ),
-                          onPressed: _unityController == null
-                              ? null
-                              : () {
-                                  if (_sentisLiveActive) {
-                                    _pauseLiveFilter();
-                                  } else {
-                                    _startLiveFilter();
-                                  }
-                                },
-                          icon: Icon(
-                            _sentisLiveActive ? Icons.auto_fix_high : Icons.play_arrow,
-                            size: 18,
-                          ),
-                          label: Text(
-                            _sentisLiveActive ? 'Live Filter Active' : 'Start Live Filter',
-                            style: const TextStyle(fontWeight: FontWeight.bold),
+                      if (_lockState == ArLockState.locked) ...[
+                        Expanded(
+                          flex: 3,
+                          child: ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF00E5FF),
+                              foregroundColor: Colors.black,
+                              padding: const EdgeInsets.symmetric(vertical: 10),
+                            ),
+                            onPressed: _maskingBusy
+                                ? null
+                                : () => _captureAndLockPreview(isUpdate: true),
+                            icon: const Icon(Icons.sync, size: 18),
+                            label: const Text(
+                              'Update view',
+                              style: TextStyle(fontWeight: FontWeight.bold),
+                            ),
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      OutlinedButton.icon(
-                        style: OutlinedButton.styleFrom(
-                          backgroundColor: Colors.black.withValues(alpha: 0.65),
-                          foregroundColor: const Color(0xFF00E5FF),
-                          side: const BorderSide(color: Color(0xFF00E5FF)),
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          flex: 2,
+                          child: OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              backgroundColor: Colors.black.withValues(alpha: 0.65),
+                              foregroundColor: Colors.white,
+                              side: const BorderSide(color: Colors.white38),
+                              padding: const EdgeInsets.symmetric(vertical: 10),
+                            ),
+                            onPressed: _releaseLock,
+                            icon: const Icon(Icons.lock_open, size: 18),
+                            label: const Text('Release'),
+                          ),
                         ),
-                        onPressed: _unityController == null || _maskingBusy
-                            ? null
-                            : _refineMaskWithBackend,
-                        icon: const Icon(Icons.hd_outlined, size: 18),
-                        label: const Text('HD Cut'),
-                      ),
+                        if (_lastGoodPolishedBytes != null) ...[
+                          const SizedBox(width: 8),
+                          IconButton.filled(
+                            style: IconButton.styleFrom(
+                              backgroundColor: const Color(0xFF1F2430),
+                              foregroundColor: const Color(0xFF00E5FF),
+                            ),
+                            tooltip: 'Save / Share HD Reference',
+                            icon: const Icon(Icons.ios_share, size: 20),
+                            onPressed: () => _showHdShowroomSheet(_lastGoodPolishedBytes!),
+                          ),
+                        ],
+                      ] else ...[
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF00E5FF),
+                              foregroundColor: Colors.black,
+                              padding: const EdgeInsets.symmetric(vertical: 10),
+                            ),
+                            onPressed: _maskingBusy
+                                ? null
+                                : () => _captureAndLockPreview(),
+                            icon: Icon(
+                              _maskingBusy ? Icons.hourglass_top : Icons.lock_outline,
+                              size: 18,
+                            ),
+                            label: Text(
+                              _maskingBusy ? 'Locking showroom preview…' : 'Lock view',
+                              style: const TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                 ),

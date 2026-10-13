@@ -19,4 +19,7 @@ export class LiveSegmentationModel {
 
   @Field({ nullable: true })
   reason?: string;
+
+  @Field({ nullable: true })
+  frameId?: string;
 }

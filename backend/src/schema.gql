@@ -63,6 +63,7 @@ type LiveSegmentationModel {
   paintPixels: Int!
   source: String!
   reason: String
+  frameId: String
 }
 
 type VehicleIdentificationModel {
@@ -202,6 +203,8 @@ input IdentifyVehicleInput {
   finish: String
   panel: String
   repolishOnly: Boolean
+  frameId: String
+  hdMode: Boolean
 }
 
 input CreateInspectionInput {
