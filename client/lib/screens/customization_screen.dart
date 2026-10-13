@@ -156,8 +156,11 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       _maskingBusy = true;
       _capturingForMask = true;
       _capturingForStudioShare = false;
+      _pendingHdPreview = !silent;
       if (!silent || !_hasActiveMask) {
-        _unityStatus = 'Locking live paint mask onto car body…';
+        _unityStatus = !silent
+            ? 'Rendering Showroom HD Cut & locking precision mask…'
+            : 'Locking live paint mask onto car body…';
       }
     });
 
@@ -167,6 +170,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       setState(() {
         _capturingForMask = false;
         _maskingBusy = false;
+        _pendingHdPreview = false;
         if (!silent) {
           _unityStatus = 'Camera frame capture timed out.';
         }
@@ -174,7 +178,98 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     });
   }
 
+  bool _pendingHdPreview = false;
+
+  void _showHdShowroomSheet(Uint8List polishedBytes) {
+    final paintName = _selected['PAINT']?.name ?? 'Custom Paint';
+    final hexLabel = _paintColor ?? '#9B1B30';
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF141820),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.hd, color: Color(0xFF00E5FF), size: 22),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Showroom HD Cut · $paintName ($hexLabel)',
+                        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white70),
+                      onPressed: () => Navigator.pop(ctx),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(14),
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxHeight: MediaQuery.of(ctx).size.height * 0.52,
+                    ),
+                    child: Image.memory(
+                      polishedBytes,
+                      fit: BoxFit.contain,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () => Navigator.pop(ctx),
+                        icon: const Icon(Icons.videocam, size: 18),
+                        label: const Text('Back to Live AR'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: () async {
+                          final tempFile = File(
+                            '${Directory.systemTemp.path}/autocraft-hd-${DateTime.now().millisecondsSinceEpoch}.jpg',
+                          );
+                          await tempFile.writeAsBytes(polishedBytes, flush: true);
+                          if (ctx.mounted) Navigator.pop(ctx);
+                          await Share.shareXFiles(
+                            [XFile(tempFile.path)],
+                            text:
+                                'Auto-Body Shop HD Paint Reference · $_displayVehicleTitle · $paintName ($hexLabel) · Finish: ${_finish.toUpperCase()}',
+                          );
+                        },
+                        icon: const Icon(Icons.ios_share, size: 18),
+                        label: const Text('Save / Share HD'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Future<void> _processLiveMaskSnapshot(String path) async {
+    final showHdSheet = _pendingHdPreview;
+    _pendingHdPreview = false;
     try {
       final file = File(path);
       if (!await file.exists()) {
@@ -251,6 +346,11 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
         _hasActiveMask = true;
         _unityStatus = 'Live car filter active · Tap any color or finish below';
       });
+
+      final polishedB64 = data['polishedBase64'] as String?;
+      if (showHdSheet && polishedB64 != null && polishedB64.isNotEmpty && mounted) {
+        _showHdShowroomSheet(base64Decode(polishedB64));
+      }
     } catch (error) {
       if (!mounted) return;
       setState(() {

@@ -35,29 +35,59 @@ def load_model() -> YOLO:
     return YOLO(target)
 
 
-def clean_foreground_car_silhouette(raw_mask: np.ndarray) -> np.ndarray:
-    """Sever thin bridges to background objects and erode 3px so feathered paint never bleeds outside the car."""
-    h, w = raw_mask.shape[:2]
-    mask_u8 = (raw_mask > 0.52).astype(np.uint8) * 255
+def guided_filter_mask(guide: np.ndarray, src: np.ndarray, radius: int = 4, eps: float = 1e-3) -> np.ndarray:
+    """O(N) Edge-Aware Guided Image Filter (He et al.) that snaps mask boundaries to exact image edges
+    so white cars painted black/red have zero white outline halos."""
+    ksize = (2 * radius + 1, 2 * radius + 1)
+    mean_I = cv2.boxFilter(guide, cv2.CV_32F, ksize)
+    mean_p = cv2.boxFilter(src, cv2.CV_32F, ksize)
+    mean_Ip = cv2.boxFilter(guide * src, cv2.CV_32F, ksize)
+    cov_Ip = mean_Ip - mean_I * mean_p
+    mean_II = cv2.boxFilter(guide * guide, cv2.CV_32F, ksize)
+    var_I = mean_II - mean_I * mean_I
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, ksize)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, ksize)
+    q = mean_a * guide + mean_b
+    return np.clip(q, 0.0, 1.0)
 
-    k_sever = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    opened = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, k_sever)
+
+def clean_foreground_car_silhouette(raw_mask: np.ndarray) -> np.ndarray:
+    """Extract the primary foreground vehicle silhouette without inward erosion so side mirrors,
+    fender edges, and lower bumper lips stay 100% covered with zero white outline halo."""
+    h, w = raw_mask.shape[:2]
+    mask_u8 = (raw_mask > 0.46).astype(np.uint8) * 255
+
+    # Use a light opening only to locate the main vehicle body if small detached background blobs exist
+    k_probe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    opened = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, k_probe)
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
-    if num_labels <= 1:
+    if num_labels > 1:
+        largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        seed = (labels == largest_label).astype(np.uint8) * 255
+        # Dilate seed slightly and intersect with mask_u8 so side mirrors and bumper lips remain intact
+        seed_reach = cv2.dilate(seed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)), iterations=1)
+        core_candidates = cv2.bitwise_and(mask_u8, seed_reach)
+        num_c, lbl_c, st_c, _ = cv2.connectedComponentsWithStats(core_candidates, connectivity=8)
+        if num_c > 1:
+            main_c = 1 + int(np.argmax(st_c[1:, cv2.CC_STAT_AREA]))
+            core = (lbl_c == main_c).astype(np.uint8) * 255
+        else:
+            core = seed
+    else:
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
         if num_labels <= 1:
             return np.zeros((h, w), dtype=np.uint8)
-
-    largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    core = (labels == largest_label).astype(np.uint8) * 255
+        largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        core = (labels == largest_label).astype(np.uint8) * 255
 
     contours, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     solid = np.zeros_like(core)
     cv2.drawContours(solid, contours, -1, 255, thickness=cv2.FILLED)
-
-    solid_tight = cv2.erode(solid, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=1)
-    return solid_tight
+    solid = cv2.morphologyEx(solid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    return solid
 
 
 def detect_license_plate_region(
@@ -92,9 +122,9 @@ def detect_license_plate_region(
     zone_thresh = float(np.percentile(vert_energy[plate_zone], 85))
     plate_candidates = (
         plate_zone
-        & (val > 0.28)
+        & (val > 0.24)
         & (sat < 0.55)
-        & (vert_energy > max(zone_thresh, 0.042))
+        & (vert_energy > max(zone_thresh, 0.040))
     )
     plate_u8 = cv2.morphologyEx(
         plate_candidates.astype(np.uint8) * 255,
@@ -113,12 +143,11 @@ def detect_license_plate_region(
         px = int(p_st[idx, cv2.CC_STAT_LEFT])
         py = int(p_st[idx, cv2.CC_STAT_TOP])
         aspect = pw / float(max(ph, 1))
-        rel_cy = ((py + 0.5 * ph) - (rel_y[0, 0] * (-span_y))) / float(max(span_y, 1))
         if (
             (0.10 * span_x <= pw <= 0.33 * span_x)
             and (0.045 * span_y <= ph <= 0.20 * span_y)
             and (1.18 <= aspect <= 4.2)
-            and parea >= max(120, int(0.005 * span_x * span_y))
+            and parea >= max(100, int(0.0045 * span_x * span_y))
         ):
             roi_energy = float(np.mean(vert_energy[py : py + ph, px : px + pw]))
             aspect_fit = 1.0 - min(0.5, abs(aspect - 2.15) * 0.22)
@@ -151,7 +180,6 @@ def blur_license_plate_privacy(img_bgr: np.ndarray, license_plate: np.ndarray | 
     roi = out[y0:y1, x0:x1]
     if roi.size == 0:
         return out
-    # Combine pixelation + heavy Gaussian blur so alphanumeric plate characters are completely unreadable
     rh, rw = roi.shape[:2]
     small = cv2.resize(roi, (max(5, rw // 8), max(3, rh // 6)), interpolation=cv2.INTER_LINEAR)
     mosaic = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
@@ -166,7 +194,7 @@ def build_paint_mask(
     raw_car_mask: np.ndarray,
     return_plate: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """Extract clean, hole-free automotive sheet-metal mask with windshield, window, headlight, tail-light, emblem/logo, grille, license-plate, and wheel cutouts."""
+    """Extract clean, hole-free automotive sheet-metal mask with Edge-Aware Guided Filtering and lighting-adaptive cutouts."""
     h, w = raw_car_mask.shape[:2]
     solid = clean_foreground_car_silhouette(raw_car_mask)
 
@@ -218,7 +246,7 @@ def build_paint_mask(
     rel_y = (yy - y_min) / float(span_y)
     rel_x = (xx - x_min) / float(span_x)
 
-    core_zone = (solid > 0) & (rel_y >= 0.38) & (rel_y <= 0.58) & (rel_x >= 0.24) & (rel_x <= 0.76)
+    core_zone = (solid > 0) & (rel_y >= 0.36) & (rel_y <= 0.56) & (rel_x >= 0.24) & (rel_x <= 0.76)
     med_val = float(np.median(val[core_zone])) if np.any(core_zone) else 0.25
     med_sat = float(np.median(sat[core_zone])) if np.any(core_zone) else 0.15
     med_grad = float(np.median(local_grad[core_zone])) if np.any(core_zone) else 0.08
@@ -229,14 +257,58 @@ def build_paint_mask(
     width_ratio_022 = ((probe_xs[-1] - probe_xs[0]) / float(span_x)) if len(probe_xs) > 10 else 0.0
     is_wide_side_view = (span_x >= int(0.85 * w)) and (width_ratio_022 > 0.84)
 
-    # Detect central rear/front license plate early so its vertical position (trunk recess vs low front bumper) informs view type
+    # Bilateral symmetric side-mirror recovery on front/rear views:
+    # When one side mirror is captured by YOLO (e.g. against dark brick) but the opposite mirror blends into a bright wall,
+    # mirror the detected ear's vertical band and recover matching body-colored mirror pixels on the opposite side.
+    if (not is_wide_side_view) and (not is_cropped_top):
+        ym_top = max(0, y_min + int(round(0.14 * span_y)))
+        ym_bot = min(h - 1, y_min + int(round(0.32 * span_y)))
+        ym_ref = min(h - 1, y_min + int(round(0.33 * span_y)))
+        ref_xs = np.where(solid[ym_ref] > 0)[0]
+        top_xs_m = np.where(solid[ym_top] > 0)[0]
+        if len(ref_xs) > 20 and len(top_xs_m) > 14:
+            for y_m in range(ym_top + 4, ym_bot):
+                r_xs = np.where(solid[y_m] > 0)[0]
+                if len(r_xs) < 14:
+                    continue
+                t_m = (y_m - ym_top) / float(max(ym_ref - ym_top, 1))
+                exp_lx = (1.0 - t_m) * float(top_xs_m[0]) + t_m * float(ref_xs[0])
+                exp_rx = (1.0 - t_m) * float(top_xs_m[-1]) + t_m * float(ref_xs[-1])
+                right_ear = float(r_xs[-1]) - exp_rx
+                left_ear = exp_lx - float(r_xs[0])
+                if right_ear > 0.035 * span_x and left_ear < 0.018 * span_x:
+                    ear_w = int(round(min(right_ear * 1.18, 0.095 * span_x)))
+                    x0_l = max(0, int(round(r_xs[0])) - ear_w)
+                    x1_l = int(round(r_xs[0])) + 2
+                    band_val = val[y_m, x0_l:x1_l]
+                    band_sat = sat[y_m, x0_l:x1_l]
+                    match = (np.abs(band_val - med_val) < 0.28) & (band_sat < max(med_sat + 0.16, 0.26)) & (band_val > 0.35)
+                    if np.any(match):
+                        solid[y_m, x0_l:x1_l][match] = 255
+                elif left_ear > 0.035 * span_x and right_ear < 0.018 * span_x:
+                    ear_w = int(round(min(left_ear * 1.18, 0.095 * span_x)))
+                    x0_r = max(0, int(round(r_xs[-1])) - 1)
+                    x1_r = min(w, int(round(r_xs[-1])) + ear_w)
+                    band_val = val[y_m, x0_r:x1_r]
+                    band_sat = sat[y_m, x0_r:x1_r]
+                    match = (np.abs(band_val - med_val) < 0.28) & (band_sat < max(med_sat + 0.16, 0.26)) & (band_val > 0.35)
+                    if np.any(match):
+                        solid[y_m, x0_r:x1_r][match] = 255
+            solid = cv2.morphologyEx(solid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 5)))
+            ys, xs = np.where(solid > 0)
+            y_min, y_max = int(ys.min()), int(ys.max())
+            x_min, x_max = int(xs.min()), int(xs.max())
+            span_y = max(y_max - y_min, 1)
+            span_x = max(x_max - x_min, 1)
+            rel_y = (yy - y_min) / float(span_y)
+            rel_x = (xx - x_min) / float(span_x)
+
     license_plate = detect_license_plate_region(
         solid, val, sat, gx, gy, local_grad, rel_x, rel_y, span_x, span_y, med_grad
     )
     plate_ys = np.where(license_plate)[0]
     plate_rel_cy = ((float(np.mean(plate_ys)) - y_min) / float(span_y)) if len(plate_ys) > 0 else -1.0
 
-    # Detect crimson/red tail lights on rear views (only if license plate isn't mounted low on a front bumper)
     is_red_hue = (hue <= 20.0) | (hue >= 158.0)
     body_red_fraction = float(np.mean((red_excess[core_zone] > 0.10) & (sat[core_zone] > 0.28))) if np.any(core_zone) else 0.0
     front_plate_detected = plate_rel_cy > 0.74
@@ -266,16 +338,15 @@ def build_paint_mask(
     )
     is_front_view = (not is_wide_side_view) and (not is_rear_view)
 
-    # Set upper glass bottom boundary (cabin_y1_ratio) based on view so rear spoiler and front upper hood stay 100% painted
-    cabin_y0 = y_min + int(round(0.055 * span_y))
+    cabin_y0 = y_min + int(round(0.052 * span_y))
     if is_wide_side_view:
         cabin_y1_ratio = 0.310
     elif is_rear_view:
         cabin_y1_ratio = 0.320
     else:
-        cabin_y1_ratio = 0.308
+        cabin_y1_ratio = 0.306
     cabin_y1 = y_min + int(round(cabin_y1_ratio * span_y))
-    pillar_inset = 0.080 if is_wide_side_view else 0.062
+    pillar_inset = 0.080 if is_wide_side_view else 0.060
 
     cutout = np.zeros((h, w), dtype=np.uint8)
     prev_lx: float | None = None
@@ -317,7 +388,6 @@ def build_paint_mask(
         if gx1 > gx0 + 8:
             for x in range(max(0, gx0), min(w, gx1)):
                 t = (x - gx0) / float(max(gx1 - gx0, 1))
-                # Slight upward arch at the outer corners so hood corners stay 100% painted
                 corner_arch = (0.012 * span_y * ((2.0 * t - 1.0) ** 2)) if is_front_view else 0.0
                 y_cowl_at_x = (1.0 - t) * y_left_end + t * y_right_end - corner_arch
                 if y <= int(round(y_cowl_at_x)):
@@ -335,16 +405,16 @@ def build_paint_mask(
         cutout = cv2.morphologyEx(cutout, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
 
     # 3. Detect manufacturer emblem/logo (compact central oval badge) and rear chrome trunk garnish bar
-    emblem_y_zone = ((rel_y >= 0.38) & (rel_y <= 0.52)) if is_rear_view else ((rel_y >= 0.58) & (rel_y <= 0.72))
+    emblem_y_zone = ((rel_y >= 0.38) & (rel_y <= 0.52)) if is_rear_view else ((rel_y >= 0.57) & (rel_y <= 0.72))
     emblem_candidates = (
         (solid > 0)
         & (not is_wide_side_view)
-        & (rel_x >= 0.44)
-        & (rel_x <= 0.56)
+        & (rel_x >= 0.43)
+        & (rel_x <= 0.57)
         & emblem_y_zone
         & (~license_plate)
         & (sat < 0.28)
-        & (grad > max(med_grad * 2.4, 0.16))
+        & (grad > max(med_grad * 2.3, 0.15))
     )
     emblem_u8 = cv2.morphologyEx(
         emblem_candidates.astype(np.uint8) * 255,
@@ -357,7 +427,7 @@ def build_paint_mask(
         ew = int(e_st[idx, cv2.CC_STAT_WIDTH])
         eh = int(e_st[idx, cv2.CC_STAT_HEIGHT])
         earea = int(e_st[idx, cv2.CC_STAT_AREA])
-        if (0.03 * span_x <= ew <= 0.12 * span_x) and (0.025 * span_y <= eh <= 0.090 * span_y) and earea >= 35:
+        if (0.03 * span_x <= ew <= 0.13 * span_x) and (0.025 * span_y <= eh <= 0.095 * span_y) and earea >= 35:
             emblem_cut[e_lbl == idx] = True
 
     if is_rear_view and med_val < 0.56:
@@ -403,53 +473,63 @@ def build_paint_mask(
         lower_cut = ((headlights | wheels | taillights | license_plate | emblem_cut).astype(np.uint8)) * 255
         lower_cut = cv2.morphologyEx(lower_cut, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)))
     else:
-        # 4. Headlights: anatomically sloped outer lamp corners (higher at outer fender, lower at inner grille tip)
+        # 4. Headlights: anatomically sloped outer lamp corners requiring internal reflector gradient
+        # so shaded white bumper/fender paint at dusk (which is smooth, local_grad < 0.05) is NEVER cut out
         edge_dist = np.minimum(rel_x, 1.0 - rel_x)
-        hl_y_max = 0.625 + 0.42 * edge_dist
-        if med_val > 0.55:
-            headlights = (
+        hl_y_max = 0.620 + 0.38 * edge_dist
+        if med_val > 0.45:
+            raw_hl = (
                 (solid > 0)
                 & is_front_view
-                & (rel_y >= 0.47)
+                & (rel_y >= 0.46)
                 & (rel_y <= hl_y_max)
-                & ((rel_x <= 0.205) | (rel_x >= 0.810))
-                & ((local_val < 0.47) | ((local_val < 0.53) & (local_grad > max(med_grad * 1.45, 0.085))))
+                & ((rel_x <= 0.195) | (rel_x >= 0.825))
+                & (local_val < min(med_val - 0.06, 0.48))
+                & (local_grad > max(med_grad * 1.45, 0.088))
             )
             hl_u8 = cv2.morphologyEx(
-                headlights.astype(np.uint8) * 255,
+                raw_hl.astype(np.uint8) * 255,
                 cv2.MORPH_CLOSE,
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 11)),
             )
-            headlights = (hl_u8 > 0) & (solid > 0)
+            hl_cnts, _ = cv2.findContours(hl_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            hl_filled = np.zeros_like(hl_u8)
+            cv2.drawContours(hl_filled, hl_cnts, -1, 255, thickness=cv2.FILLED)
+            headlights = (hl_filled > 0) & (solid > 0)
         else:
             headlights = (
                 (solid > 0)
                 & is_front_view
                 & (rel_y >= 0.46)
                 & (rel_y <= hl_y_max + 0.02)
-                & ((rel_x <= 0.22) | (rel_x >= 0.78))
+                & ((rel_x <= 0.21) | (rel_x >= 0.79))
                 & (local_grad > max(med_grad * 1.75, 0.14))
                 & ((local_val > max(med_val + 0.09, 0.26)) | (local_grad > 0.20))
             )
 
-        # 5. Front upper radiator grille (dark honeycomb/slat opening between headlights, rel_y in 0.58..0.76)
-        # Never cut shaded white nose panels (val > 0.36); only cut the actual dark radiator grille opening & central badge
+        # 5. Front upper radiator grille (dark honeycomb/slat opening between headlights, rel_y in 0.56..0.74)
+        # Clamp after MORPH_CLOSE so the white painted surround around the radiator grille has ZERO white halo
         if is_front_view:
-            if med_val > 0.55:
-                front_grille = (
+            if med_val > 0.45:
+                grille_dark_thresh = min(med_val * 0.52, 0.34)
+                raw_grille = (
                     (solid > 0)
-                    & (rel_y >= 0.58)
-                    & (rel_y <= 0.76)
+                    & (rel_y >= 0.56)
+                    & (rel_y <= 0.74)
                     & (rel_x >= 0.27)
                     & (rel_x <= 0.73)
-                    & (val < 0.35)
+                    & (val < grille_dark_thresh)
                 )
                 fg_u8 = cv2.morphologyEx(
-                    front_grille.astype(np.uint8) * 255,
+                    raw_grille.astype(np.uint8) * 255,
                     cv2.MORPH_CLOSE,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (27, 15)),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 13)),
                 )
-                front_grille = (fg_u8 > 0) & (solid > 0)
+                front_grille = (
+                    (fg_u8 > 0)
+                    & (solid > 0)
+                    & ((val < min(med_val * 0.64, 0.42)) | emblem_cut | ((rel_x >= 0.43) & (rel_x <= 0.57) & (rel_y >= 0.57) & (rel_y <= 0.68)))
+                )
             else:
                 front_grille = (
                     (solid > 0)
@@ -462,33 +542,39 @@ def build_paint_mask(
         else:
             front_grille = np.zeros((h, w), dtype=bool)
 
-        # 6. Lower bumper intake grille & fog light bezels (strictly dark openings val < 0.28 so white bumper lips stay 100% painted)
+        # 6. Lower bumper intake slot & fog light bezels:
+        # Anchor threshold to the lower bumper's own median brightness so a shadowed white lower bumper lip at dusk/night stays 100% painted
+        lower_bumper_zone = (solid > 0) & (rel_y >= 0.75) & (~license_plate)
+        lower_med_val = float(np.median(val[lower_bumper_zone])) if np.any(lower_bumper_zone) else med_val
+        intake_dark_thresh = min(lower_med_val * 0.52, 0.20)
+
+        in_lower_slot = (rel_y >= 0.78) & (rel_y <= 0.925) & (rel_x >= 0.24) & (rel_x <= 0.76)
+        in_fog_pocket = (rel_y >= 0.75) & (rel_y <= 0.895) & ((rel_x <= 0.18) | (rel_x >= 0.82))
         grille_and_underbody = (
             (solid > 0)
-            & (rel_y >= 0.78)
+            & (in_lower_slot | in_fog_pocket)
             & (
-                ((med_val > 0.55) & (val < 0.28))
-                | ((med_val <= 0.55) & (rel_x >= 0.22) & (rel_x <= 0.78) & (local_grad > max(med_grad * 2.2, 0.16)) & (val < 0.35))
+                ((med_val > 0.45) & (val < intake_dark_thresh))
+                | ((med_val <= 0.45) & (local_grad > max(med_grad * 2.2, 0.16)) & (val < 0.28))
             )
         )
 
-        # 7. Circular wheel-arch zones at bottom-left and bottom-right corners (strictly dark tire rubber val < 0.24)
-        arch_left = ((rel_x - 0.04) / 0.14) ** 2 + ((rel_y - 0.86) / 0.20) ** 2 <= 1.0
-        arch_right = ((rel_x - 0.96) / 0.14) ** 2 + ((rel_y - 0.86) / 0.20) ** 2 <= 1.0
+        # 7. Circular wheel-arch zones at bottom-left and bottom-right corners (strictly jet-black tire rubber)
+        arch_left = ((rel_x - 0.03) / 0.12) ** 2 + ((rel_y - 0.88) / 0.18) ** 2 <= 1.0
+        arch_right = ((rel_x - 0.97) / 0.12) ** 2 + ((rel_y - 0.88) / 0.18) ** 2 <= 1.0
         wheels = (
             (solid > 0)
             & (arch_left | arch_right)
             & (local_grad > max(med_grad * 1.85, 0.15))
-            & (val < 0.24)
+            & (val < min(lower_med_val * 0.55, 0.20))
         )
 
         lower_cut = (
             (headlights | front_grille | grille_and_underbody | wheels | taillights | license_plate | emblem_cut).astype(np.uint8)
         ) * 255
-        k_low = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        k_low = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         lower_cut = cv2.morphologyEx(lower_cut, cv2.MORPH_CLOSE, k_low)
-        lower_cut = cv2.morphologyEx(lower_cut, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        # Ensure intentional cutouts (tail lights, headlights, grille, emblem, license plate) stay 100% cut out
+        lower_cut = cv2.morphologyEx(lower_cut, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         lower_cut[taillights | license_plate | emblem_cut | headlights | front_grille] = 255
 
     paint_bin = (solid > 0) & (cutout == 0) & (lower_cut == 0)
@@ -496,52 +582,78 @@ def build_paint_mask(
 
     num_l, lbls, st, _ = cv2.connectedComponentsWithStats(paint_u8, connectivity=8)
     clean_u8 = np.zeros_like(paint_u8)
-    min_island = 110
+    min_island = 85
     for idx in range(1, num_l):
         if st[idx, cv2.CC_STAT_AREA] >= min_island:
             clean_u8[lbls == idx] = 255
 
-    clean_u8 = cv2.morphologyEx(clean_u8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
-    clean_u8[taillights | license_plate | emblem_cut] = 0
+    clean_u8 = cv2.morphologyEx(clean_u8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    clean_u8[taillights | license_plate | emblem_cut | front_grille | headlights] = 0
 
-    # Crisp 5x5 anti-aliased edge strictly clamped inside solid so ZERO pixels bleed outside the car
-    feathered = cv2.GaussianBlur(clean_u8, (5, 5), 0).astype(np.float32) / 255.0
-    outer_clamp = cv2.GaussianBlur(solid, (3, 3), 0).astype(np.float32) / 255.0
-    feathered = np.minimum(feathered, outer_clamp)
-    feathered[license_plate] = 0.0
+    # O(N) Edge-Aware Guided Image Filter: snaps mask boundaries to exact image luminance edges
+    # and locks interior sheet-metal alpha to 1.0 (255) so white cars have zero white outline halos
+    clean_f = clean_u8.astype(np.float32) / 255.0
+    guided = guided_filter_mask(gray, clean_f, radius=3, eps=1e-3)
+    sharp_alpha = np.clip((guided - 0.24) / 0.38, 0.0, 1.0)
+    solid_f = (solid > 0).astype(np.float32)
+    sharp_alpha = np.minimum(sharp_alpha, cv2.GaussianBlur(solid_f, (3, 3), 0))
+    sharp_alpha[license_plate | taillights | emblem_cut] = 0.0
 
-    final_mask = np.clip(feathered * 255.0, 0, 255).astype(np.uint8)
+    final_mask = np.clip(sharp_alpha * 255.0, 0, 255).astype(np.uint8)
     if return_plate:
         return final_mask, license_plate
     return final_mask
 
 
-def compute_retinex_intrinsic_shading(gray: np.ndarray, car_region: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute Retinex shadow-equalized 3D intrinsic shading and specular layer so cast building shadows
-    don't split a car's hood/body into two different colors, while preserving 3D hood creases and reflections."""
-    smooth_luma = cv2.bilateralFilter(gray, 9, 0.10, 9.0)
-    illum = cv2.GaussianBlur(smooth_luma, (25, 25), 0)
-    rel_luma = smooth_luma / np.maximum(illum, 0.18)
+def compute_retinex_intrinsic_shading(
+    gray: np.ndarray,
+    car_region: np.ndarray,
+    mask_u8: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Dichromatic Reflection + 3D Fresnel Intrinsic Decomposition:
+    Separates:
+    1. norm_shade: 3D macro-curvature + shadow-softened panel shading (without flattening hood curvature!)
+    2. micro_detail: crisp panel seams, door handles, and hood creases
+    3. spec_layer: glass-like clear-coat sky/horizon/light reflections (visible even on Gloss Black!)
+    4. fresnel_dome: 3D grazing-angle roll-off near outer fender/hood contours
+    """
+    h, w = gray.shape[:2]
+    smooth_luma = cv2.bilateralFilter(gray, 9, 0.09, 9.0)
+    k_illum = max(51, int(round(min(h, w) * 0.22)) | 1)
+    illum = cv2.GaussianBlur(smooth_luma, (k_illum, k_illum), 0)
+    rel_luma = smooth_luma / np.maximum(illum, 0.22)
 
     if np.any(car_region):
         vals_raw = smooth_luma[car_region]
         p5_raw = float(np.percentile(vals_raw, 5))
         p95_raw = float(np.percentile(vals_raw, 95))
-        norm_raw = np.clip((smooth_luma - p5_raw) / max(p95_raw - p5_raw, 0.12), 0.0, 1.0)
+        norm_raw = np.clip((smooth_luma - p5_raw) / max(p95_raw - p5_raw, 0.14), 0.0, 1.0)
 
         vals_rel = rel_luma[car_region]
         p5_rel = float(np.percentile(vals_rel, 5))
         p95_rel = float(np.percentile(vals_rel, 95))
-        norm_rel = np.clip((rel_luma - p5_rel) / max(p95_rel - p5_rel, 0.08), 0.0, 1.0)
+        norm_rel = np.clip((rel_luma - p5_rel) / max(p95_rel - p5_rel, 0.14), 0.0, 1.0)
 
-        # Blend 76% Retinex illumination-invariant shading with 24% global luminance
-        norm_shade = 0.76 * norm_rel + 0.24 * norm_raw
+        norm_shade = 0.68 * norm_raw + 0.32 * norm_rel
     else:
+        norm_raw = smooth_luma
         norm_shade = smooth_luma
 
     micro_detail = gray - smooth_luma
-    spec_layer = np.clip((norm_shade - 0.62) / 0.38, 0.0, 1.0) ** 1.6
-    return norm_shade, micro_detail, spec_layer
+
+    # Clear-coat reflection layer: combines direct sky highlights + reflected horizon/building contours
+    spec_direct = np.clip((norm_raw - 0.62) / 0.38, 0.0, 1.0) ** 1.65
+    horizon_ref = np.clip((smooth_luma - cv2.GaussianBlur(smooth_luma, (31, 31), 0)) * 3.2, 0.0, 1.0)
+    spec_layer = np.clip(np.maximum(spec_direct, horizon_ref * (0.30 + 0.70 * norm_raw)), 0.0, 1.0)
+
+    if mask_u8 is not None and np.any(mask_u8 > 64):
+        dist = cv2.distanceTransform((mask_u8 > 64).astype(np.uint8), cv2.DIST_L2, 5)
+        max_d = max(float(np.percentile(dist[mask_u8 > 64], 85)), 12.0)
+        fresnel_dome = 0.78 + 0.22 * (np.clip(dist / max_d, 0.0, 1.0) ** 0.55)
+    else:
+        fresnel_dome = np.ones_like(gray)
+
+    return norm_shade, micro_detail, spec_layer, fresnel_dome
 
 
 def encode_intrinsic_mask_bgr(
@@ -550,14 +662,14 @@ def encode_intrinsic_mask_bgr(
     license_plate: np.ndarray | None = None,
 ) -> np.ndarray:
     """Pack 3-channel PNG for Unity CarLivePaint.shader:
-    - Red channel (_MaskTex.r): crisp sheet-metal paint mask alpha (0..255)
-    - Green channel (_MaskTex.g): Retinex shadow-normalized 3D intrinsic shading + panel creases (0..255)
-    - Blue channel (_MaskTex.b): clear-coat specular highlight (0..240) inside mask, or 255 on license_plate for live privacy blur
+    - Red channel (_MaskTex.r): Guided-filter sheet-metal paint mask alpha (0..255)
+    - Green channel (_MaskTex.g): 3D Fresnel + Dichromatic intrinsic shading (0..255)
+    - Blue channel (_MaskTex.b): Clear-coat specular reflection (0..240) inside mask, or 255 on license_plate for live privacy blur
     """
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     car_region = mask_u8 > 80
-    norm_shade, micro_detail, spec_layer = compute_retinex_intrinsic_shading(gray, car_region)
-    intrinsic_shade = np.clip(norm_shade + micro_detail * 0.75, 0.0, 1.0)
+    norm_shade, micro_detail, spec_layer, fresnel_dome = compute_retinex_intrinsic_shading(gray, car_region, mask_u8)
+    intrinsic_shade = np.clip(norm_shade * fresnel_dome + micro_detail * 0.85, 0.0, 1.0)
 
     r_u8 = mask_u8
     g_u8 = np.clip(intrinsic_shade * 255.0, 0, 255).astype(np.uint8)
@@ -630,7 +742,6 @@ def select_primary_vehicle_mask(result, work_h: int, work_w: int) -> np.ndarray 
     if chosen.shape[0] != work_h or chosen.shape[1] != work_w:
         chosen = cv2.resize(chosen, (work_w, work_h), interpolation=cv2.INTER_LINEAR)
 
-    # Subtract only smaller secondary background vehicle masks (e.g. a parked car behind the foreground car)
     for other_idx in range(len(masks)):
         if other_idx == best_idx:
             continue
@@ -643,7 +754,7 @@ def select_primary_vehicle_mask(result, work_h: int, work_w: int) -> np.ndarray 
             other = cv2.resize(other, (work_w, work_h), interpolation=cv2.INTER_LINEAR)
         chosen[other > 0.35] = 0.0
 
-    return (chosen > 0.58).astype(np.uint8)
+    return (chosen > 0.46).astype(np.uint8)
 
 
 def apply_panel_gate(mask_f: np.ndarray, panel: str) -> np.ndarray:
@@ -666,7 +777,6 @@ def apply_panel_gate(mask_f: np.ndarray, panel: str) -> np.ndarray:
     rel_x = (xx - x_min) / float(span_x)
 
     if panel == "hood":
-        # Natural tapered hood contour between windshield base and front grille
         inset = 0.09 + 0.08 * np.clip((rel_y - 0.38) / 0.45, 0.0, 1.0)
         gate = ((rel_y >= 0.38) & (rel_y <= 0.84) & (rel_x >= inset) & (rel_x <= (1.0 - inset))).astype(np.float32)
     elif panel == "roof":
@@ -688,7 +798,8 @@ def studio_polish_car_paint(
     panel: str = "body",
     license_plate: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Photorealistic Intrinsic Automotive Clear-Coat & Shading Reconstructor for Auto-Body Shop Reference."""
+    """Showroom-Grade Dichromatic Reflection + Fresnel Clear-Coat Reconstructor.
+    100% opaque base-coat pigment replacement (zero white bleed-through) with separated glass-like clear-coat reflections."""
     hex_clean = (hex_color or "#9B1B30").lstrip("#").strip()
     if len(hex_clean) != 6:
         hex_clean = "9B1B30"
@@ -704,60 +815,64 @@ def studio_polish_car_paint(
     img_f = base_bgr.astype(np.float32) / 255.0
     gray = cv2.cvtColor(base_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
 
-    alpha = np.clip((mask_u8.astype(np.float32) / 255.0) / 0.85, 0.0, 1.0)
-    alpha = cv2.GaussianBlur(alpha, (3, 3), 0) * (mask_u8 > 8).astype(np.float32)
+    # Hard-locked interior alpha (1.0 across all sheet metal) with sub-pixel guided edge anti-aliasing
+    raw_alpha = mask_u8.astype(np.float32) / 255.0
+    alpha = np.clip((raw_alpha - 0.12) / 0.38, 0.0, 1.0)
     alpha = apply_panel_gate(alpha, panel)
 
     car_region = mask_u8 > 80
     if not np.any(car_region):
         return base_bgr
 
-    norm_shade, micro_detail, spec_layer = compute_retinex_intrinsic_shading(gray, car_region)
+    norm_shade, micro_detail, spec_layer, fresnel_dome = compute_retinex_intrinsic_shading(gray, car_region, mask_u8)
 
     finish = (finish or "gloss").lower().strip()
     if finish == "matte":
-        base_curve = 0.38 + 0.52 * (norm_shade ** 0.85)
-        spec_strength = 0.06
-        env_blend = 0.05
+        base_curve = (0.34 + 0.62 * (norm_shade ** 0.92)) * fresnel_dome
+        spec_strength = 0.03
     elif finish == "satin":
-        base_curve = 0.34 + 0.62 * (norm_shade ** 0.90)
-        spec_strength = 0.22
-        env_blend = 0.12
+        base_curve = (0.30 + 0.70 * (norm_shade ** 0.96)) * fresnel_dome
+        spec_strength = 0.14
     elif finish == "metallic":
-        base_curve = 0.28 + 0.78 * (norm_shade ** 0.95)
-        spec_strength = 0.55
-        env_blend = 0.22
+        base_curve = (0.24 + 0.88 * (norm_shade ** 1.02)) * fresnel_dome
+        spec_strength = 0.28
     elif finish == "candy":
-        base_curve = 0.22 + 0.88 * (norm_shade ** 1.05)
-        spec_strength = 0.62
-        env_blend = 0.24
+        # Deep candy tri-coat: rich dark-cherry/candy shadows at grazing angles with luminous saturated highlights
+        base_curve = (0.20 + 0.94 * (norm_shade ** 1.08)) * (fresnel_dome ** 1.15)
+        spec_strength = 0.26
     else:
-        base_curve = 0.26 + 0.80 * (norm_shade ** 0.95)
-        spec_strength = 0.50
-        env_blend = 0.20
+        # Showroom Gloss: deep, saturated base coat with crisp pinpoint clear-coat reflection
+        base_curve = (0.24 + 0.88 * (norm_shade ** 1.02)) * fresnel_dome
+        spec_strength = 0.22
 
     target_luma = 0.114 * b_t + 0.587 * g_t + 0.299 * r_t
     if target_luma > 0.70:
-        base_curve = 0.54 + 0.46 * (norm_shade ** 0.80)
-        spec_strength *= 0.60
+        base_curve = (0.52 + 0.48 * (norm_shade ** 0.85)) * fresnel_dome
+        spec_strength *= 0.50
     elif target_luma < 0.12:
-        # Deep obsidian/jet-black automotive coat: rich dark base with crisp clear-coat reflections
-        base_curve = 0.05 + 0.22 * (norm_shade ** 1.15)
-        spec_strength = 0.05 if finish == "matte" else 0.38
-        env_blend = 0.04 if finish == "matte" else 0.16
+        # Showroom Obsidian / Jet Black: deep black base coat + real glass-like sky/horizon reflections on the hood
+        base_curve = (0.04 + 0.22 * (norm_shade ** 1.15)) * fresnel_dome
+        spec_strength = 0.04 if finish == "matte" else 0.30
 
-    shading_3d = np.clip(base_curve + micro_detail * 0.75, 0.03, 1.25)[:, :, None]
+    shading_3d = np.clip(base_curve + micro_detail * 0.95, 0.02, 1.32)[:, :, None]
     if target_luma < 0.12:
-        jet_tint = np.maximum(target_bgr, np.array([0.08, 0.08, 0.08], dtype=np.float32))
+        jet_tint = np.maximum(target_bgr, np.array([0.09, 0.085, 0.08], dtype=np.float32))
         diffuse_paint = jet_tint[None, None, :] * shading_3d
+        # On Gloss Black, broad horizon/sky clear-coat reflections give real automotive glass depth
+        coat_mask = (spec_layer ** 1.30)[:, :, None]
+        spec_tint = np.array([1.04, 1.00, 0.96], dtype=np.float32)
+        specular_add = coat_mask * spec_tint[None, None, :] * spec_strength
+        sky_reflect = img_f * (coat_mask * (0.02 if finish == "matte" else 0.14))
+        painted_bgr = np.clip(diffuse_paint + specular_add + sky_reflect, 0.0, 1.0)
     else:
+        # On Colored Paints (Candy Red, Carmine Red, Blue, etc.), keep 100% pure chromatic saturation across midtones
+        # and restrict white specular glints strictly to pinpoint highlights (spec_layer ** 2.4) so paint is NEVER see-through or pink!
         diffuse_paint = target_bgr[None, None, :] * shading_3d
+        pinpoint_glint = (np.clip((norm_shade - 0.74) / 0.26, 0.0, 1.0) ** 2.4)[:, :, None]
+        spec_tint = 0.38 * np.ones(3, dtype=np.float32) + 0.62 * target_bgr
+        specular_add = pinpoint_glint * spec_tint[None, None, :] * spec_strength
+        painted_bgr = np.clip(diffuse_paint + specular_add, 0.0, 1.0)
 
-    spec_tint = (0.65 * np.ones(3, dtype=np.float32) + 0.35 * target_bgr) if finish in ("metallic", "candy") else np.ones(3, dtype=np.float32)
-    specular_add = spec_layer[:, :, None] * spec_tint[None, None, :] * spec_strength
-    env_reflection = img_f * (spec_layer[:, :, None] * env_blend)
-
-    painted_bgr = np.clip(diffuse_paint + specular_add + env_reflection, 0.0, 1.0)
     a3 = alpha[:, :, None]
     comp = (1.0 - a3) * img_f + a3 * painted_bgr
     return np.clip(comp * 255.0, 0, 255).astype(np.uint8)
@@ -770,10 +885,11 @@ def process_frame(
     finish: str = "gloss",
     panel: str = "body",
     repolish_only: bool = False,
+    hd_mode: bool = False,
 ) -> dict:
     global LAST_CLEAN_BGR, LAST_MASK_U8, LAST_PLATE_BOOL, LAST_SOURCE
 
-    if repolish_only and LAST_CLEAN_BGR is not None and LAST_MASK_U8 is not None:
+    if repolish_only and (not hd_mode) and LAST_CLEAN_BGR is not None and LAST_MASK_U8 is not None:
         work_bgr = LAST_CLEAN_BGR
         paint_u8 = LAST_MASK_U8
         plate_bool = LAST_PLATE_BOOL
@@ -787,7 +903,8 @@ def process_frame(
             return {"ok": False, "reason": "Could not decode camera frame"}
 
         orig_h, orig_w = frame_bgr.shape[:2]
-        max_dim = 540
+        # Tier 2 (HD Cut / Studio Share) runs at 960px for crisp showroom fidelity; Tier 1 Live AR runs at 540px
+        max_dim = 960 if hd_mode else 540
         scale = min(1.0, max_dim / float(max(orig_h, orig_w)))
         work_w = max(32, int(round(orig_w * scale)))
         work_h = max(32, int(round(orig_h * scale)))
@@ -805,19 +922,19 @@ def process_frame(
         if primary_mask is None:
             return {"ok": False, "reason": "Point camera clearly at a vehicle to lock live paint mask"}
 
-        source = "yolov8s-seg"
+        source = "yolov8s-seg-hd" if hd_mode else "yolov8s-seg"
         paint_u8, plate_bool = build_paint_mask(work_bgr, primary_mask, return_plate=True)
 
         # Multi-frame temporal consensus: when camera is settled on the same vehicle (IoU >= 0.82),
         # blend with previous mask to eliminate single-frame flicker or boundary jitter
-        if LAST_MASK_U8 is not None and LAST_MASK_U8.shape == paint_u8.shape:
+        if (not hd_mode) and LAST_MASK_U8 is not None and LAST_MASK_U8.shape == paint_u8.shape:
             curr_b = paint_u8 > 64
             prev_b = LAST_MASK_U8 > 64
             inter = int(np.count_nonzero(curr_b & prev_b))
             union = int(np.count_nonzero(curr_b | prev_b))
             if union > 0 and (inter / float(union)) >= 0.82:
                 paint_u8 = np.clip(
-                    0.72 * paint_u8.astype(np.float32) + 0.28 * LAST_MASK_U8.astype(np.float32),
+                    0.75 * paint_u8.astype(np.float32) + 0.25 * LAST_MASK_U8.astype(np.float32),
                     0,
                     255,
                 ).astype(np.uint8)
@@ -840,7 +957,7 @@ def process_frame(
 
     paint_pixels = int(np.count_nonzero(paint_u8 > 64))
     ok_enc, png_buf = cv2.imencode(".png", intrinsic_mask_bgr)
-    ok_pol, pol_buf = cv2.imencode(".jpg", polished_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    ok_pol, pol_buf = cv2.imencode(".jpg", polished_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     if not ok_enc or not ok_pol:
         return {"ok": False, "reason": "Failed to encode mask/polished output"}
 
@@ -974,6 +1091,7 @@ def main() -> int:
                 finish = payload.get("finish", "gloss")
                 panel = payload.get("panel", "body")
                 repolish_only = bool(payload.get("repolishOnly", False))
+                hd_mode = bool(payload.get("hdMode", False)) or (mode == "hd_polish")
                 res = process_frame(
                     model,
                     image_b64,
@@ -981,6 +1099,7 @@ def main() -> int:
                     finish=finish,
                     panel=panel,
                     repolish_only=repolish_only,
+                    hd_mode=hd_mode,
                 )
             res["id"] = req_id
         except Exception as exc:
