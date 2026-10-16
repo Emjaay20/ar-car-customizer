@@ -5,7 +5,7 @@ import 'auth_session.dart';
 class GraphQLService {
   static const String defaultApiUrl = String.fromEnvironment(
     'API_URL',
-    defaultValue: 'https://ar-car-backend.aetherhost.com.ng/graphql',
+    defaultValue: 'http://192.168.100.66:3000/graphql',
   );
 
   static String _currentUrl = defaultApiUrl;

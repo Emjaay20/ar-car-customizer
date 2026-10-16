@@ -116,9 +116,9 @@ Shader "ARCar/LivePaint"
                 float crease = saturate(sqrt(lumaDx * lumaDx + lumaDy * lumaDy) * 4.5);
                 float ao = clamp(1.0 - crease * 0.75, 0.30, 1.0);
 
-                // 2. Car-normalized 3D shading
-                bool hasIntrinsic = abs(maskSample.r - maskSample.g) > 0.015 || abs(maskSample.g - maskSample.b) > 0.015;
-                float normShade = hasIntrinsic ? intrinsicShade : smoothstep(0.08, 0.88, luma);
+                // 2. Car-normalized 3D shading derived directly from the live 60 FPS camera feed
+                // Preserves dynamic live lighting, shadows, and reflections without baking stale snapshot ghosting
+                float normShade = smoothstep(0.06, 0.90, luma);
 
                 // 3. 3D Surface normal & geometric grazing sheen
                 float2 gradient = float2(ddx(mask), ddy(mask));
@@ -297,8 +297,7 @@ Shader "ARCar/LivePaint"
 
                 float3 scene = tex2D(_SceneTex, input.uv).rgb;
                 float luma = dot(scene, float3(0.2126, 0.7152, 0.0722));
-                bool hasIntrinsic = abs(maskSample.r - maskSample.g) > 0.015 || abs(maskSample.g - maskSample.b) > 0.015;
-                float normShade = hasIntrinsic ? maskSample.g : smoothstep(0.08, 0.88, luma);
+                float normShade = smoothstep(0.06, 0.90, luma);
 
                 float paintLuma = dot(_Tint.rgb, float3(0.2126, 0.7152, 0.0722));
                 float ambientFloor = (paintLuma < 0.12) ? 0.14 : lerp(0.68, 0.55, _Smoothness);

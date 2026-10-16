@@ -1,1 +1,1 @@
-https://ar-car-backend.aetherhost.com.ng/graphql
+http://192.168.100.66:3000/graphql

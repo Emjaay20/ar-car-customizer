@@ -9,15 +9,23 @@ if [ -z "$DATABASE_URL" ] || echo "$DATABASE_URL" | grep -q -E "localhost|127.0.
   mkdir -p /run/postgresql /var/lib/postgresql/data
   chown -R postgres:postgres /run/postgresql /var/lib/postgresql/data
 
+  if command -v su-exec >/dev/null 2>&1; then
+    SU="su-exec postgres"
+  elif command -v gosu >/dev/null 2>&1; then
+    SU="gosu postgres"
+  else
+    SU="su -s /bin/sh postgres -c"
+  fi
+
   if [ ! -d "/var/lib/postgresql/data/base" ]; then
     echo "Initializing new PostgreSQL cluster..."
-    su-exec postgres initdb -D /var/lib/postgresql/data --auth=trust
-    su-exec postgres pg_ctl -D /var/lib/postgresql/data -o "-c listen_addresses='127.0.0.1'" start
-    su-exec postgres psql -U postgres -c "CREATE USER admin WITH SUPERUSER PASSWORD 'adminpassword';" || true
-    su-exec postgres createdb -U postgres -O admin ar_car_customizer || true
+    $SU initdb -D /var/lib/postgresql/data --auth=trust
+    $SU pg_ctl -D /var/lib/postgresql/data -o "-c listen_addresses='127.0.0.1'" start
+    $SU psql -U postgres -c "CREATE USER admin WITH SUPERUSER PASSWORD 'adminpassword';" || true
+    $SU createdb -U postgres -O admin ar_car_customizer || true
   else
     echo "Starting existing PostgreSQL cluster..."
-    su-exec postgres pg_ctl -D /var/lib/postgresql/data -o "-c listen_addresses='127.0.0.1'" start
+    $SU pg_ctl -D /var/lib/postgresql/data -o "-c listen_addresses='127.0.0.1'" start
   fi
 
   export DATABASE_URL="postgresql://admin:adminpassword@127.0.0.1:5432/ar_car_customizer?schema=public"

@@ -19,6 +19,12 @@ public class LiveCarFilter : MonoBehaviour
     float strength = 0.95f;
     float panel;
 
+    // Mask viewpoint anchor tracking
+    Vector3 maskCamPos;
+    Quaternion maskCamRot = Quaternion.identity;
+    bool hasMaskPose = false;
+    float motionFade = 1.0f;
+
     // Locked Showroom Full-Frame Quad
     GameObject lockedQuad;
     Material lockedMaterial;
@@ -83,6 +89,25 @@ public class LiveCarFilter : MonoBehaviour
         transform.localPosition = new Vector3(offsetX, offsetY, Distance);
         transform.localRotation = Quaternion.identity;
         transform.localScale = new Vector3(width, height, 1f);
+
+        if (material != null && maskApplied && hasMaskPose)
+        {
+            float angleDelta = Quaternion.Angle(camera.transform.rotation, maskCamRot);
+            float distDelta = Vector3.Distance(camera.transform.position, maskCamPos);
+            // If the user rotates or pans the camera away from where the mask was captured,
+            // smoothly fade out the mask so it never floats as an unanchored ghost sticker
+            if (angleDelta > 3.5f || distDelta > 0.14f)
+            {
+                float angleFade = Mathf.Clamp01(1.0f - (angleDelta - 3.5f) / 5.5f);
+                float distFade = Mathf.Clamp01(1.0f - (distDelta - 0.14f) / 0.22f);
+                motionFade = Mathf.Min(angleFade, distFade);
+            }
+            else
+            {
+                motionFade = 1.0f;
+            }
+            material.SetFloat("_Strength", (maskApplied && !isLocked) ? (strength * motionFade) : 0f);
+        }
 
         if (lockedQuad != null && lockedQuad.activeSelf)
         {
@@ -216,6 +241,18 @@ public class LiveCarFilter : MonoBehaviour
         if (!EnsureMaterial()) return false;
         maskApplied = mask != null;
         material.SetTexture("_MaskTex", mask != null ? mask : Texture2D.blackTexture);
+        var camera = GetComponentInParent<Camera>();
+        if (camera != null && mask != null)
+        {
+            maskCamPos = camera.transform.position;
+            maskCamRot = camera.transform.rotation;
+            hasMaskPose = true;
+            motionFade = 1.0f;
+        }
+        else if (mask == null)
+        {
+            hasMaskPose = false;
+        }
         ApplyFinish();
         return mask != null;
     }
