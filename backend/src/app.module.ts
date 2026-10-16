@@ -16,6 +16,7 @@ import { JobCardModule } from './jobcard/jobcard.module.js';
     GraphQLModule.forRoot<ApolloDriverConfig>({
       driver: ApolloDriver,
       autoSchemaFile: join(process.cwd(), 'src/schema.gql'),
+      introspection: true,
       context: ({ req }: { req: unknown }) => ({ req }),
     }),
     PrismaModule,
