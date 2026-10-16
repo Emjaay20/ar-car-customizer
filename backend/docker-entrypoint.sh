@@ -27,7 +27,7 @@ echo "Running Prisma migrations..."
 npx prisma db push --accept-data-loss || true
 
 echo "Seeding database with demo catalog..."
-./node_modules/.bin/tsx prisma/seed.ts || npx prisma db seed || true
+npx prisma db seed || tsx prisma/seed.ts || true
 
 echo "Starting NestJS server on port ${PORT:-3000}..."
 exec node dist/main.js

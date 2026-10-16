@@ -29,7 +29,7 @@ COPY package*.json ./
 COPY prisma ./prisma/
 
 # Install production dependencies and tsx for seed script
-RUN npm install --omit=dev && npm install tsx
+RUN npm install --omit=dev && npm install -g tsx
 
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
