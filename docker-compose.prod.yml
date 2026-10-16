@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: ar_car_db_prod
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-ar_car_customizer}
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-ar_car_customizer}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ar_car_backend_prod
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-adminpassword}@db:5432/${POSTGRES_DB:-ar_car_customizer}?schema=public
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
+      PORT: 3000
+      SEED_DB: ${SEED_DB:-true}
+      VISION_API_KEY: ${VISION_API_KEY:-}
+    ports:
+      - '3000:3000'
+    volumes:
+      - ./backend/public/models:/app/public/models
+      - ./backend/public/masks:/app/public/masks
+      - ./backend/public/damages:/app/public/damages
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ar-backend.rule=Host(`ar-backend.aetherhost.com.ng`)"
+      - "traefik.http.routers.ar-backend.entrypoints=websecure"
+      - "traefik.http.routers.ar-backend.tls=true"
+      - "traefik.http.services.ar-backend.loadbalancer.server.port=3000"
+
+volumes:
+  postgres_data:

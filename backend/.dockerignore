@@ -1,0 +1,14 @@
+node_modules
+dist
+.env
+.env.local
+*.log
+*.err
+npm-debug.log*
+.git
+.agents
+.claude
+.cursor
+.devin
+test
+vitest.config*

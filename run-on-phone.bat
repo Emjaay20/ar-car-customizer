@@ -13,8 +13,14 @@ echo ================================================
 echo   AR Car Customizer - Run on Samsung S25 Ultra
 echo ================================================
 echo.
-echo Using your WiFi IP: 192.168.100.66
-echo Make sure start-backend.bat is still open.
+set "BACKEND_ENDPOINT=http://192.168.100.66:3000/graphql"
+if exist "%~dp0backend-url.txt" (
+  set /p LOADED_URL=<"%~dp0backend-url.txt"
+  if defined LOADED_URL set "BACKEND_ENDPOINT=!LOADED_URL!"
+)
+
+echo Backend URL: !BACKEND_ENDPOINT!
+echo Make sure your backend (local or VPS) is reachable.
 echo A USB cable is not required.
 echo.
 
@@ -34,7 +40,7 @@ echo   First run can take 5-15 minutes. Leave this window open.
 echo ================================================
 echo.
 
-call flutter run --dart-define=API_URL=http://192.168.100.66:3000/graphql -d "!DEVICE!"
+call flutter run --dart-define=API_URL=!BACKEND_ENDPOINT! -d "!DEVICE!"
 echo.
 echo Flutter exited.
 pause
