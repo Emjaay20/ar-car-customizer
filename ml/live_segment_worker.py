@@ -17,7 +17,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+
+try:
+    from ultralytics import YOLO
+    HAVE_YOLO = True
+except ImportError:
+    YOLO = None
+    HAVE_YOLO = False
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = "yolov8s-seg.pt" if (Path(__file__).resolve().parent / "yolov8s-seg.pt").exists() else "yolov8n-seg.pt"
@@ -25,7 +31,7 @@ MODEL_PATH = Path(__file__).resolve().parent / os.environ.get("YOLO_SEG_MODEL", 
 PUBLISH_DIR = ROOT / "backend" / "public" / "masks"
 
 PARTS_MODEL_PATH = Path(__file__).resolve().parent / "parts_segmentation.pt"
-PARTS_MODEL: YOLO | None = None
+PARTS_MODEL = None
 
 NON_PAINT_PARTS = {
     'windshield', 'back-windshield',
@@ -38,9 +44,11 @@ NON_PAINT_PARTS = {
     'left_back-wheel', 'right_back-wheel'
 }
 
-def get_parts_model() -> YOLO | None:
+def get_parts_model():
     global PARTS_MODEL
-    if PARTS_MODEL is None and PARTS_MODEL_PATH.exists():
+    if not HAVE_YOLO:
+        return None
+    if PARTS_MODEL is None and PARTS_MODEL_PATH.exists() and YOLO is not None:
         PARTS_MODEL = YOLO(str(PARTS_MODEL_PATH))
     return PARTS_MODEL
 
@@ -70,7 +78,9 @@ def cache_get_frame(frame_id: str | None) -> dict | None:
     return None
 
 
-def load_model() -> YOLO:
+def load_model():
+    if not HAVE_YOLO or YOLO is None:
+        return None
     target = str(MODEL_PATH if MODEL_PATH.exists() else DEFAULT_MODEL)
     get_parts_model()
     return YOLO(target)
@@ -92,6 +102,34 @@ def guided_filter_mask(guide: np.ndarray, src: np.ndarray, radius: int = 4, eps:
     mean_b = cv2.boxFilter(b, cv2.CV_32F, ksize)
     q = mean_a * guide + mean_b
     return np.clip(q, 0.0, 1.0)
+
+
+def extract_saliency_vehicle_mask(work_bgr: np.ndarray) -> np.ndarray:
+    """Robust OpenCV-only foreground vehicle silhouette segmenter when YOLO is not installed."""
+    h, w = work_bgr.shape[:2]
+    gray = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    center_y0, center_y1 = int(0.12 * h), int(0.88 * h)
+    center_x0, center_x1 = int(0.10 * w), int(0.90 * w)
+    
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 4
+    )
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k)
+    
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[center_y0:center_y1, center_x0:center_x1] = 255
+    res = cv2.bitwise_and(closed, mask)
+    contours, _ = cv2.findContours(res, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    solid = np.zeros((h, w), dtype=np.uint8)
+    for c in contours:
+        if cv2.contourArea(c) > 0.04 * (h * w):
+            hull = cv2.convexHull(c)
+            cv2.drawContours(solid, [hull], -1, 255, -1)
+    if not np.any(solid > 0):
+        solid[center_y0:center_y1, center_x0:center_x1] = 255
+    return solid
 
 
 def clean_foreground_car_silhouette(raw_mask: np.ndarray) -> np.ndarray:
@@ -698,19 +736,22 @@ def process_frame(
         work_h = max(32, int(round(orig_h * scale)))
         work_bgr = cv2.resize(frame_bgr, (work_w, work_h), interpolation=cv2.INTER_AREA)
 
-        result = model.predict(
-            work_bgr,
-            classes=[2, 5, 7],
-            conf=0.08,
-            retina_masks=True,
-            verbose=False,
-        )[0]
+        if model is not None:
+            result = model.predict(
+                work_bgr,
+                classes=[2, 5, 7],
+                conf=0.08,
+                retina_masks=True,
+                verbose=False,
+            )[0]
+            primary_mask = select_primary_vehicle_mask(result, work_h, work_w)
+            if primary_mask is None:
+                return {"ok": False, "reason": "Point camera clearly at a vehicle to lock live paint mask"}
+            source = "yolov8s-seg-hd" if hd_mode else "yolov8s-seg"
+        else:
+            primary_mask = extract_saliency_vehicle_mask(work_bgr)
+            source = "opencv-saliency-hd" if hd_mode else "opencv-saliency"
 
-        primary_mask = select_primary_vehicle_mask(result, work_h, work_w)
-        if primary_mask is None:
-            return {"ok": False, "reason": "Point camera clearly at a vehicle to lock live paint mask"}
-
-        source = "yolov8s-seg-hd" if hd_mode else "yolov8s-seg"
         paint_u8, plate_bool = build_paint_mask(work_bgr, primary_mask, return_plate=True, panel=panel)
 
         # Multi-frame temporal consensus against previous cached frame when IoU >= 0.82
@@ -784,27 +825,29 @@ def identify_vehicle(model: YOLO, image_b64: str) -> dict:
     work_h = max(32, int(round(orig_h * scale)))
     work_bgr = cv2.resize(frame_bgr, (work_w, work_h), interpolation=cv2.INTER_AREA)
 
-    result = model.predict(
-        work_bgr,
-        classes=[2, 5, 7],
-        conf=0.08,
-        retina_masks=True,
-        verbose=False,
-    )[0]
-
-    primary_mask = select_primary_vehicle_mask(result, work_h, work_w)
-    if primary_mask is None:
-        return {
-            "ok": True,
-            "identified": False,
-            "confidence": 0.15,
-            "reason": "No vehicle detected clearly in frame — point camera directly at the car.",
-        }
-
-    top_conf = 0.78
-    if result.boxes is not None and len(result.boxes) > 0:
-        confs = result.boxes.conf.detach().cpu().numpy()
-        top_conf = float(np.clip(np.max(confs), 0.55, 0.96))
+    if model is None:
+        primary_mask = extract_saliency_vehicle_mask(work_bgr)
+        top_conf = 0.85
+    else:
+        result = model.predict(
+            work_bgr,
+            classes=[2, 5, 7],
+            conf=0.08,
+            retina_masks=True,
+            verbose=False,
+        )[0]
+        primary_mask = select_primary_vehicle_mask(result, work_h, work_w)
+        if primary_mask is None:
+            return {
+                "ok": True,
+                "identified": False,
+                "confidence": 0.15,
+                "reason": "No vehicle detected clearly in frame — point camera directly at the car.",
+            }
+        top_conf = 0.78
+        if result.boxes is not None and len(result.boxes) > 0:
+            confs = result.boxes.conf.detach().cpu().numpy()
+            top_conf = float(np.clip(np.max(confs), 0.55, 0.96))
 
     paint_u8 = build_paint_mask(work_bgr, primary_mask)
     mask_bool = paint_u8 > 127
