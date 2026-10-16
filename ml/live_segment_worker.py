@@ -749,8 +749,10 @@ def process_frame(
                 return {"ok": False, "reason": "Point camera clearly at a vehicle to lock live paint mask"}
             source = "yolov8s-seg-hd" if hd_mode else "yolov8s-seg"
         else:
-            primary_mask = extract_saliency_vehicle_mask(work_bgr)
-            source = "opencv-saliency-hd" if hd_mode else "opencv-saliency"
+            return {
+                "ok": False,
+                "reason": "YOLO AI runs on Local PC. Tap the DNS icon in top bar to connect to Local PC (192.168.100.66).",
+            }
 
         paint_u8, plate_bool = build_paint_mask(work_bgr, primary_mask, return_plate=True, panel=panel)
 

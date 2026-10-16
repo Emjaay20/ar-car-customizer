@@ -1,11 +1,8 @@
-FROM node:22-bookworm-slim AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache openssl libc6-compat
 
 COPY package*.json ./
 COPY prisma ./prisma/
@@ -18,26 +15,11 @@ RUN npx prisma generate
 RUN npm run build
 
 # Runner stage
-FROM node:22-bookworm-slim AS runner
+FROM node:22-alpine AS runner
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssl \
-    curl \
-    ca-certificates \
-    postgresql \
-    postgresql-contrib \
-    gosu \
-    python3 \
-    python3-pip \
-    python3-venv \
-    libgl1 \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip3 install --no-cache-dir --break-system-packages torch torchvision --index-url https://download.pytorch.org/whl/cpu
-RUN pip3 install --no-cache-dir --break-system-packages ultralytics opencv-python-headless numpy
+RUN apk add --no-cache openssl libc6-compat curl postgresql postgresql-contrib su-exec python3 py3-pip py3-numpy py3-opencv
 
 ENV NODE_ENV=production
 ENV PORT=3000
