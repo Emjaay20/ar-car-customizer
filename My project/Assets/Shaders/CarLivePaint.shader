@@ -108,71 +108,68 @@ Shader "ARCar/LivePaint"
                 float intrinsicShade = maskSample.g;
                 float intrinsicSpec = maskSample.b;
 
-                float2 gradient = float2(ddx(mask), ddy(mask));
-                float3 normal = normalize(float3(-gradient * 4.5, 1.0));
-                float3 lightDir = normalize(float3(0.35, 0.75, 0.60));
-                float ndotl = saturate(dot(normal, lightDir));
-                float3 halfDir = normalize(lightDir + float3(0, 0, 1));
-                float specPower = lerp(10.0, 96.0, _Smoothness);
-                float geomSpec = pow(saturate(dot(normal, halfDir)), specPower) * _Smoothness * _Smoothness;
-
+                // 1. Live camera crease / shutline Ambient Occlusion (AO)
+                // Preserves deep door seams, hood gaps, badges without cartoon outlines
                 float luma = dot(scene, float3(0.2126, 0.7152, 0.0722));
-                // High-frequency live camera crease/seam detail (ddx/ddy local contrast)
                 float lumaDx = ddx(luma);
                 float lumaDy = ddy(luma);
-                float microEdge = saturate(sqrt(lumaDx * lumaDx + lumaDy * lumaDy) * 3.5);
+                float crease = saturate(sqrt(lumaDx * lumaDx + lumaDy * lumaDy) * 4.5);
+                float ao = clamp(1.0 - crease * 0.75, 0.30, 1.0);
 
-                // Combine car-normalized 3D shading from worker (maskSample.g) with live camera shading
-                // If an older monochrome mask is used (where R == G == B), fall back to normalized luma curve
+                // 2. Car-normalized 3D shading
                 bool hasIntrinsic = abs(maskSample.r - maskSample.g) > 0.015 || abs(maskSample.g - maskSample.b) > 0.015;
                 float normShade = hasIntrinsic ? intrinsicShade : smoothstep(0.08, 0.88, luma);
 
-                // Dichromatic Reflection Model matching studio_polish_car_paint:
-                // 100% opaque chromatic base-coat pigment replacement + separated clear-coat specular reflection
-                float shadeMin = lerp(0.32, 0.22, _Smoothness);
-                float shadeSpan = lerp(0.64, 0.90, _Smoothness);
+                // 3. 3D Surface normal & geometric grazing sheen
+                float2 gradient = float2(ddx(mask), ddy(mask));
+                float edgeGrad = length(gradient) * 3.5;
+                float grazing = saturate(edgeGrad);
+
+                // 4. PBR Finish-dependent parameters
                 float paintLuma = dot(_Tint.rgb, float3(0.2126, 0.7152, 0.0722));
-                if (paintLuma > 0.70)
-                {
-                    shadeMin = 0.52;
-                    shadeSpan = 0.48;
-                }
-                else if (paintLuma < 0.12)
-                {
-                    shadeMin = 0.04;
-                    shadeSpan = 0.22;
-                }
-
-                float bodyShade = (shadeMin + shadeSpan * pow(saturate(normShade), 1.02)) * (1.0 - microEdge * 0.28);
-                bodyShade = lerp(bodyShade, bodyShade * lerp(0.88, 1.08, ndotl), 0.22);
-
-                float specLayer = hasIntrinsic
-                    ? saturate(intrinsicSpec / 0.92)
-                    : pow(smoothstep(0.68, 0.96, normShade), 1.8);
+                
+                float ambientFloor = lerp(0.68, 0.55, _Smoothness);
+                float directScale = lerp(0.36, 0.54, _Smoothness);
+                float clearcoatF0 = 0.03;
+                float clearcoatGrazing = lerp(0.10, 0.38, _Smoothness);
+                float specPower = lerp(12.0, 64.0, _Smoothness);
 
                 if (paintLuma < 0.12)
                 {
-                    // Showroom Obsidian / Gloss Black: deep black base coat + broad horizon/sky clear-coat reflection
-                    half3 baseTint = max(_Tint.rgb, half3(0.09, 0.085, 0.08));
-                    half3 diffuse = baseTint * bodyShade;
-                    float coatMask = pow(specLayer, 1.30);
-                    float specStrength = (_Smoothness < 0.35) ? 0.04 : (_Smoothness * 0.30);
-                    half3 totalSpec = half3(1.04, 1.00, 0.96) * (coatMask * specStrength + geomSpec * 0.16);
-                    half3 skyReflect = scene * (coatMask * ((_Smoothness < 0.35) ? 0.02 : 0.14));
-                    return saturate(diffuse + totalSpec + skyReflect);
+                    // Showroom Obsidian / Gloss Black: deep base + glass-like clearcoat
+                    ambientFloor = 0.14;
+                    directScale = 0.26;
+                    clearcoatF0 = 0.05;
+                    clearcoatGrazing = 0.45;
                 }
-                else
+                else if (paintLuma > 0.72)
                 {
-                    // Colored Paints (Candy Red, Carmine Red, Blue, etc.):
-                    // Preserve 100% pure chromatic saturation across midtones (zero white camera wash!)
-                    // and restrict specular highlight strictly to pinpoint clear-coat glints
-                    half3 diffuse = _Tint.rgb * bodyShade * (1.0 - _Metallic * 0.12);
-                    float pinpointGlint = pow(smoothstep(0.74, 1.00, normShade), 2.4);
-                    float specStrength = _Smoothness * _Smoothness * lerp(0.20, 0.30, _Metallic);
-                    half3 specColor = lerp(half3(0.38, 0.38, 0.38) + _Tint.rgb * 0.62, half3(1, 1, 1), 0.25);
-                    half3 totalSpec = specColor * (pinpointGlint * specStrength + geomSpec * 0.18);
-                    return saturate(diffuse + totalSpec);
+                    // Metallic Silver / Pure White
+                    ambientFloor = 0.72;
+                    directScale = 0.38;
                 }
+
+                half3 effectiveTint = (paintLuma < 0.12) ? max(_Tint.rgb, half3(0.08, 0.08, 0.08)) : _Tint.rgb;
+
+                // Diffuse basecoat: 100% solid pigment, modulated by normalized lighting & AO
+                float baseIllum = ambientFloor + directScale * pow(saturate(normShade), 0.88);
+                half3 diffuse = effectiveTint * (baseIllum * ao);
+
+                // Clearcoat dielectric specular reflection (Schlick Fresnel approximation)
+                float directGlint = pow(saturate((normShade - 0.66) / 0.34), specPower / 14.0);
+                float fresnelSheen = clearcoatF0 + (clearcoatGrazing - clearcoatF0) * grazing;
+                
+                half3 clearcoatColor = half3(1.0, 0.98, 0.96);
+                half3 specular = clearcoatColor * (directGlint * 0.38 + fresnelSheen * 0.40);
+
+                if (_Metallic > 0.25)
+                {
+                    // Metallic flake micro-sparkle in midtones
+                    float flake = saturate(abs(lumaDx) + abs(lumaDy)) * _Metallic * 0.40;
+                    diffuse *= (1.0 + flake);
+                }
+
+                return saturate(diffuse + specular);
             }
 
             Varyings vert(Attributes input)
@@ -204,10 +201,12 @@ Shader "ARCar/LivePaint"
 
                 half3 paintRgb = ShadePaint(maskSample, scene);
 
-                // Hard-locked 100% opaque base-coat interior with crisp Guided-Filter edge anti-aliasing
-                float smoothMask = smoothstep(0.08, 0.24, mask);
+                // Solid paint: 100% solid core across all sheet metal (zero see-through)
+                // Sub-pixel anti-aliasing strictly at the mask perimeter
+                float edgeAA = smoothstep(0.02, 0.14, mask);
+                float solidCore = smoothstep(0.16, 0.30, mask);
                 float effectiveStrength = (_Strength > 0.01) ? 1.0 : 0.0;
-                float alpha = saturate(smoothMask * effectiveStrength);
+                float alpha = saturate(lerp(edgeAA, 1.0, solidCore) * effectiveStrength);
                 if (alpha < 0.004) discard;
 
                 return half4(paintRgb, alpha);
@@ -300,20 +299,23 @@ Shader "ARCar/LivePaint"
                 float luma = dot(scene, float3(0.2126, 0.7152, 0.0722));
                 bool hasIntrinsic = abs(maskSample.r - maskSample.g) > 0.015 || abs(maskSample.g - maskSample.b) > 0.015;
                 float normShade = hasIntrinsic ? maskSample.g : smoothstep(0.08, 0.88, luma);
-                float specLayer = hasIntrinsic ? saturate(maskSample.b / 0.92) : pow(smoothstep(0.68, 0.96, normShade), 1.8);
 
                 float paintLuma = dot(_Tint.rgb, float3(0.2126, 0.7152, 0.0722));
-                float shadeMin = (paintLuma < 0.12) ? 0.04 : lerp(0.32, 0.22, _Smoothness);
-                float shadeSpan = (paintLuma < 0.12) ? 0.22 : lerp(0.64, 0.90, _Smoothness);
-                float bodyShade = shadeMin + shadeSpan * normShade;
-                fixed3 baseTint = (paintLuma < 0.12) ? max(_Tint.rgb, fixed3(0.09, 0.085, 0.08)) : _Tint.rgb;
-                fixed3 diffuse = baseTint * bodyShade * (1.0 - _Metallic * 0.12);
-                float glint = (paintLuma < 0.12) ? pow(specLayer, 1.30) : pow(smoothstep(0.74, 1.0, normShade), 2.4);
-                fixed3 specColor = (paintLuma < 0.12) ? fixed3(1.04, 1.00, 0.96) : (fixed3(0.38, 0.38, 0.38) + _Tint.rgb * 0.62);
-                float smoothMask = smoothstep(0.08, 0.24, mask);
-                float alpha = saturate(smoothMask * ((_Strength > 0.01) ? 1.0 : 0.0));
+                float ambientFloor = (paintLuma < 0.12) ? 0.14 : lerp(0.68, 0.55, _Smoothness);
+                float directScale = (paintLuma < 0.12) ? 0.26 : lerp(0.36, 0.54, _Smoothness);
+                fixed3 baseTint = (paintLuma < 0.12) ? max(_Tint.rgb, fixed3(0.08, 0.08, 0.08)) : _Tint.rgb;
+                
+                float baseIllum = ambientFloor + directScale * pow(saturate(normShade), 0.88);
+                fixed3 diffuse = baseTint * baseIllum;
+
+                float directGlint = pow(saturate((normShade - 0.66) / 0.34), lerp(1.2, 4.0, _Smoothness));
+                fixed3 specColor = fixed3(1.0, 0.98, 0.96) * directGlint * _Smoothness * 0.35;
+
+                float edgeAA = smoothstep(0.02, 0.14, mask);
+                float solidCore = smoothstep(0.16, 0.30, mask);
+                float alpha = saturate(lerp(edgeAA, 1.0, solidCore) * ((_Strength > 0.01) ? 1.0 : 0.0));
                 if (alpha < 0.004) discard;
-                return fixed4(saturate(diffuse + specColor * glint * _Smoothness * 0.28), alpha);
+                return fixed4(saturate(diffuse + specColor), alpha);
             }
             ENDCG
         }

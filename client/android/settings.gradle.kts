@@ -28,5 +28,5 @@ include(":unityLibrary")
 project(":unityLibrary").projectDir = File(rootProject.projectDir, "unityLibrary/unityLibrary")
 
 // Fix for XR/AR manifest subproject (common issue with Unity exports)
-include(":xrmanifest.androidlib")
-project(":xrmanifest.androidlib").projectDir = File(rootProject.projectDir, "unityLibrary/unityLibrary/xrmanifest.androidlib")
+include(":unityLibrary:xrmanifest.androidlib")
+project(":unityLibrary:xrmanifest.androidlib").projectDir = File(rootProject.projectDir, "unityLibrary/unityLibrary/xrmanifest.androidlib")

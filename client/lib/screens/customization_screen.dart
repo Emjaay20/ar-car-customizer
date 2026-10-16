@@ -11,10 +11,9 @@ import 'package:share_plus/share_plus.dart';
 import '../models/asset.dart';
 import '../models/car.dart';
 import '../services/auth_session.dart';
+import '../services/graphql_service.dart';
 import '../services/paint_spec.dart';
 import '../services/unity_commands.dart';
-
-enum ArLockState { searching, capturing, locked, updating, released }
 
 class CustomizationScreen extends StatefulWidget {
   final Car car;
@@ -36,7 +35,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   final Map<String, Asset> _selected = {};
   List<Asset> _catalogAssets = const [];
   UnityWidgetController? _unityController;
-  String? _unityStatus = 'Hold steady to lock preview';
+  String? _unityStatus = '🟢 Live AR Customizer · 60 FPS';
   String? _savedConfigId;
   String? _customVehicleTitle;
   bool _saving = false;
@@ -46,8 +45,6 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   bool _maskingBusy = false;
   bool _hasActiveMask = false;
   bool _sentisLiveActive = false;
-  ArLockState _lockState = ArLockState.searching;
-  String? _lockedFrameId;
   Uint8List? _lastGoodPolishedBytes;
   String _finish = 'gloss';
   String _panel = 'body';
@@ -122,10 +119,10 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   Timer? _autoMaskTimer;
 
   void _ensureAutoMaskTimer() {
-    _autoMaskTimer ??= Timer.periodic(const Duration(milliseconds: 2600), (_) {
+    _autoMaskTimer ??= Timer.periodic(const Duration(milliseconds: 2400), (_) {
       if (!mounted) return;
-      if (_sentisLiveActive && _lockState == ArLockState.searching && !_maskingBusy && !_sharingPhoto) {
-        _captureAndLockPreview(silent: true);
+      if (_sentisLiveActive && !_maskingBusy && !_sharingPhoto) {
+        _refreshLiveMask(silent: true);
       }
     });
   }
@@ -134,39 +131,37 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     if (_unityController == null) return;
     setState(() {
       _sentisLiveActive = true;
-      _lockState = ArLockState.searching;
-      _unityStatus = 'Hold steady to lock preview';
+      _unityStatus = '🟢 Live AR Customizer · 60 FPS';
     });
     _applyCurrentPaint();
     _post(UnityCommands.runSentis(stop: false));
     _ensureAutoMaskTimer();
-    _captureAndLockPreview(silent: true);
+    _refreshLiveMask(silent: false);
   }
 
   Future<void> _pauseLiveFilter() async {
     _autoMaskTimer?.cancel();
     _autoMaskTimer = null;
     if (!mounted) return;
-    _releaseLock();
     setState(() {
       _sentisLiveActive = false;
       _hasActiveMask = false;
       _maskingBusy = false;
       _capturingForMask = false;
-      _lockState = ArLockState.searching;
-      _unityStatus = 'Live filter paused · Showing untouched camera feed.';
+      _unityStatus = 'Live filter paused · Untouched camera feed';
     });
     _post(UnityCommands.runSentis(stop: true));
   }
 
-  Future<void> _captureAndLockPreview({bool silent = false, bool isUpdate = false}) async {
+  Future<void> _refreshLiveMask({bool silent = false}) async {
     if (_unityController == null || _maskingBusy || _sharingPhoto) return;
     setState(() {
       _maskingBusy = true;
       _capturingForMask = true;
       _capturingForStudioShare = false;
-      _lockState = isUpdate ? ArLockState.updating : ArLockState.capturing;
-      _unityStatus = isUpdate ? 'Updating preview angle…' : 'Locking showroom preview…';
+      if (!silent && !_hasActiveMask) {
+        _unityStatus = 'Detecting vehicle sheet metal…';
+      }
     });
 
     _post(UnityCommands.captureSnapshot(clean: true));
@@ -175,68 +170,34 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       setState(() {
         _capturingForMask = false;
         _maskingBusy = false;
-        if (_lastGoodPolishedBytes != null) {
-          _lockState = ArLockState.locked;
-          _unityStatus = 'Preview locked · Tap Update view when ready';
-        } else {
-          _lockState = ArLockState.searching;
-          _unityStatus = 'Hold steady to lock preview';
-        }
+        _unityStatus = _hasActiveMask
+            ? '🟢 Live AR Customizer · 60 FPS'
+            : 'Point camera at vehicle sheet metal';
       });
     });
   }
 
-  Future<void> _repolishLockedFrame() async {
-    final frameId = _lockedFrameId;
-    if (frameId == null || _maskingBusy) return;
-    try {
-      final client = GraphQLProvider.of(context).value;
-      final result = await client.mutate(
-        MutationOptions(
-          document: gql(segmentLiveCarMutation),
-          fetchPolicy: FetchPolicy.noCache,
-          variables: {
-            'input': {
-              'imageBase64': '',
-              'hexColor': _paintColor ?? '#9B1B30',
-              'finish': _finish,
-              'panel': _panel,
-              'repolishOnly': true,
-              'frameId': frameId,
-              'hdMode': true,
-            },
-          },
-        ),
-      );
-      final data = result.data?['segmentLiveCar'] as Map<String, dynamic>?;
-      final polB64 = data?['polishedBase64'] as String?;
-      if (polB64 != null && polB64.isNotEmpty && mounted) {
-        final bytes = base64Decode(polB64);
-        _lastGoodPolishedBytes = bytes;
-        final tempFile = File('${Directory.systemTemp.path}/arcar-locked-frame.jpg');
-        await tempFile.writeAsBytes(bytes, flush: true);
-        if (mounted) {
-          _post(UnityCommands.loadLockedFrame(tempFile.path));
-        }
-      }
-    } catch (_) {}
+  Future<void> _captureHdStudioCut() async {
+    if (_unityController == null || _sharingPhoto || _maskingBusy) return;
+    setState(() {
+      _sharingPhoto = true;
+      _capturingForStudioShare = true;
+      _capturingForMask = false;
+      _unityStatus = 'Capturing Showroom HD Studio photo…';
+    });
+
+    _post(UnityCommands.captureSnapshot(clean: true));
+    Future<void>.delayed(const Duration(seconds: 7), () {
+      if (!mounted || !_capturingForStudioShare) return;
+      setState(() {
+        _capturingForStudioShare = false;
+        _sharingPhoto = false;
+        _unityStatus = '🟢 Live AR Customizer · 60 FPS';
+      });
+      _snack('Studio snapshot timed out.');
+    });
   }
 
-  void _releaseLock() {
-    _post(UnityCommands.releaseLockedFrame());
-    setState(() {
-      _lockState = ArLockState.released;
-      _lockedFrameId = null;
-      _lastGoodPolishedBytes = null;
-      _hasActiveMask = false;
-      _unityStatus = 'Hold steady to lock preview';
-    });
-    Future<void>.delayed(const Duration(milliseconds: 250), () {
-      if (mounted && _lockState == ArLockState.released) {
-        setState(() => _lockState = ArLockState.searching);
-      }
-    });
-  }
 
   void _showHdShowroomSheet(Uint8List polishedBytes) {
     final paintName = _selected['PAINT']?.name ?? 'Custom Paint';
@@ -333,13 +294,9 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
         setState(() {
           _maskingBusy = false;
           _capturingForMask = false;
-          if (_lastGoodPolishedBytes != null) {
-            _lockState = ArLockState.locked;
-            _unityStatus = 'Preview locked · Tap Update view when ready';
-          } else {
-            _lockState = ArLockState.searching;
-            _unityStatus = 'Hold steady to lock preview';
-          }
+          _unityStatus = _hasActiveMask
+              ? '🟢 Live AR Customizer · 60 FPS'
+              : 'Point camera at vehicle sheet metal';
         });
         return;
       }
@@ -378,21 +335,12 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       }
       final data = result.data?['segmentLiveCar'] as Map<String, dynamic>?;
       if (result.hasException || data == null || data['masked'] != true || data['polishedBase64'] == null) {
-        final gqlErr = result.exception?.graphqlErrors.isNotEmpty == true
-            ? result.exception!.graphqlErrors.first.message
-            : result.exception?.linkException?.toString();
-        final reason = data?['reason']?.toString() ??
-            (gqlErr != null ? 'Server busy · Retrying…' : 'Hold steady to lock preview');
         setState(() {
           _maskingBusy = false;
           _capturingForMask = false;
-          if (_lastGoodPolishedBytes != null) {
-            _lockState = ArLockState.locked;
-            _unityStatus = 'Preview locked · Kept previous angle';
-          } else {
-            _lockState = ArLockState.searching;
-            _unityStatus = reason;
-          }
+          _unityStatus = _hasActiveMask
+              ? '🟢 Live AR Customizer · 60 FPS'
+              : (data?['reason']?.toString() ?? 'Point camera at vehicle sheet metal');
         });
         return;
       }
@@ -400,10 +348,6 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       final polishedB64 = data['polishedBase64'] as String;
       final polishedBytes = base64Decode(polishedB64);
       _lastGoodPolishedBytes = polishedBytes;
-      _lockedFrameId = data['frameId'] as String?;
-
-      final lockedFrameFile = File('${Directory.systemTemp.path}/arcar-locked-frame.jpg');
-      await lockedFrameFile.writeAsBytes(polishedBytes, flush: true);
 
       if (data['maskBase64'] != null) {
         final maskBytes = base64Decode(data['maskBase64'] as String);
@@ -415,28 +359,22 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
 
       if (!mounted || !_sentisLiveActive) return;
 
-      _post(UnityCommands.loadLockedFrame(lockedFrameFile.path));
       _applyCurrentPaint();
 
       setState(() {
         _maskingBusy = false;
         _capturingForMask = false;
         _hasActiveMask = true;
-        _lockState = ArLockState.locked;
-        _unityStatus = 'Preview locked';
+        _unityStatus = '🟢 Live AR Customizer · 60 FPS';
       });
     } catch (error) {
       if (!mounted) return;
       setState(() {
         _maskingBusy = false;
         _capturingForMask = false;
-        if (_lastGoodPolishedBytes != null) {
-          _lockState = ArLockState.locked;
-          _unityStatus = 'Preview locked · Kept previous angle';
-        } else {
-          _lockState = ArLockState.searching;
-          _unityStatus = 'Hold steady to lock preview';
-        }
+        _unityStatus = _hasActiveMask
+            ? '🟢 Live AR Customizer · 60 FPS'
+            : 'Point camera at vehicle sheet metal';
       });
     }
   }
@@ -475,7 +413,6 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     try {
       final rawBytes = await file.readAsBytes();
       if (!mounted) return;
-      final paintName = _selected['PAINT']?.name ?? 'Custom Paint';
       final client = GraphQLProvider.of(context).value;
       final result = await client.mutate(
         MutationOptions(
@@ -494,35 +431,30 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
         ),
       );
 
-      String shareFilePath = path;
       final data = result.data?['segmentLiveCar'] as Map<String, dynamic>?;
       final polishedB64 = data?['polishedBase64'] as String?;
       if (polishedB64 != null && polishedB64.isNotEmpty) {
-        final polishedFile = File(
-          '${Directory.systemTemp.path}/autocraft-reference-${DateTime.now().millisecondsSinceEpoch}.png',
-        );
-        await polishedFile.writeAsBytes(base64Decode(polishedB64), flush: true);
-        shareFilePath = polishedFile.path;
-        try {
-          await file.delete();
-        } catch (_) {}
+        final bytes = base64Decode(polishedB64);
+        _lastGoodPolishedBytes = bytes;
+        if (!mounted) return;
+        setState(() {
+          _sharingPhoto = false;
+          _unityStatus = '🟢 Live AR Customizer · 60 FPS';
+        });
+        _showHdShowroomSheet(bytes);
+        return;
       }
 
       if (!mounted) return;
       setState(() {
         _sharingPhoto = false;
-        _unityStatus = 'Live filter active · Studio reference ready to share';
+        _unityStatus = '🟢 Live AR Customizer · 60 FPS';
       });
-
-      await Share.shareXFiles(
-        [XFile(shareFilePath)],
-        text:
-            'Auto-Body Shop Paint Reference · $_displayVehicleTitle · $paintName (${_paintColor ?? "#9B1B30"}) · Finish: ${_finish.toUpperCase()} · Panel: ${_panel.toUpperCase()}',
-      );
+      _snack('Studio photo completed.');
     } catch (error) {
       if (!mounted) return;
       setState(() => _sharingPhoto = false);
-      _snack('Could not share reference photo: $error');
+      _snack('Could not capture studio photo: $error');
     }
   }
 
@@ -547,7 +479,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       if (!_sentisLiveActive) {
         _startLiveFilter();
       } else if (!_hasActiveMask && !_maskingBusy) {
-        _captureAndLockPreview(silent: true);
+        _refreshLiveMask(silent: true);
       }
       return;
     }
@@ -572,9 +504,6 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     final color = _paintColor;
     if (color == null || color.isEmpty) return;
     _sendPaint(color: color, finish: _finish, panel: _panel);
-    if (_lockState == ArLockState.locked && _lockedFrameId != null) {
-      _repolishLockedFrame();
-    }
   }
 
   void _applyHex() {
@@ -592,7 +521,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     if (!_sentisLiveActive) {
       _startLiveFilter();
     } else if (!_hasActiveMask && !_maskingBusy) {
-      _captureAndLockPreview(silent: true);
+      _refreshLiveMask(silent: true);
     }
   }
 
@@ -813,8 +742,8 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
         text.startsWith('CAMERA_SETTLED') ||
         text.startsWith('SENTIS_UNAVAILABLE') ||
         text.startsWith('SENTIS_NO_MODEL')) {
-      if (_sentisLiveActive && !_maskingBusy && !_sharingPhoto && _lockState == ArLockState.searching) {
-        _captureAndLockPreview(silent: true);
+      if (_sentisLiveActive && !_maskingBusy && !_sharingPhoto) {
+        _refreshLiveMask(silent: true);
       }
       return;
     }
@@ -920,12 +849,88 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     );
   }
 
+  void _showServerSwitchDialog() {
+    final isCloud = GraphQLService.apiUrl.contains('aetherhost');
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.dns, color: Color(0xFF00E5FF)),
+            SizedBox(width: 8),
+            Text('AR AI Backend Server', style: TextStyle(fontSize: 18)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Current: ${isCloud ? "Cloud VPS (AetherHost)" : "Local PC (192.168.100.66)"}',
+              style: const TextStyle(fontSize: 13, color: Colors.white70),
+            ),
+            const SizedBox(height: 14),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.wifi, size: 18),
+              label: const Text('Connect to Local PC (Fastest AR)'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: !isCloud ? const Color(0xFF00E5FF) : Colors.white24,
+                foregroundColor: !isCloud ? Colors.black : Colors.white,
+              ),
+              onPressed: () {
+                GraphQLService.setApiUrl('http://192.168.100.66:3000/graphql');
+                Navigator.pop(ctx);
+                setState(() {
+                  _unityStatus = 'Switched to Local PC (192.168.100.66)';
+                });
+                _refreshLiveMask(silent: false);
+              },
+            ),
+            const SizedBox(height: 10),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.cloud, size: 18),
+              label: const Text('Connect to Cloud (AetherHost)'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: isCloud ? const Color(0xFF00E5FF) : Colors.white24,
+                foregroundColor: isCloud ? Colors.black : Colors.white,
+              ),
+              onPressed: () {
+                GraphQLService.setApiUrl('https://ar-car-backend.aetherhost.com.ng/graphql');
+                Navigator.pop(ctx);
+                setState(() {
+                  _unityStatus = 'Switched to Cloud (AetherHost)';
+                });
+                _refreshLiveMask(silent: false);
+              },
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: Text(_displayVehicleTitle, style: const TextStyle(fontSize: 16)),
         actions: [
+          IconButton(
+            tooltip: 'Server Connection',
+            icon: Icon(
+              GraphQLService.apiUrl.contains('aetherhost')
+                  ? Icons.cloud_done
+                  : Icons.wifi_tethering,
+              color: const Color(0xFF00E5FF),
+            ),
+            onPressed: _showServerSwitchDialog,
+          ),
           IconButton(
             tooltip: _sentisLiveActive ? 'Pause AR Studio' : 'Start AR Studio',
             icon: Icon(
@@ -979,48 +984,51 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                     top: 10,
                     left: 12,
                     right: 12,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.72),
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(
-                          color: _sentisLiveActive || _hasActiveMask
-                              ? const Color(0xFF00E5FF)
-                              : Colors.white24,
-                        ),
-                      ),
-                      child: Row(
-                        children: [
-                          if (_maskingBusy || _sharingPhoto)
-                            const SizedBox(
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Color(0xFF00E5FF),
-                              ),
-                            )
-                          else
-                            Icon(
-                              _sentisLiveActive || _hasActiveMask
-                                  ? Icons.videocam
-                                  : Icons.center_focus_strong,
-                              size: 16,
-                              color: _sentisLiveActive || _hasActiveMask
-                                  ? const Color(0xFF00E5FF)
-                                  : Colors.white70,
-                            ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              _unityStatus!,
-                              style: const TextStyle(fontSize: 12, color: Colors.white),
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                            ),
+                    child: GestureDetector(
+                      onTap: _showServerSwitchDialog,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.72),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: _sentisLiveActive || _hasActiveMask
+                                ? const Color(0xFF00E5FF)
+                                : Colors.white24,
                           ),
-                        ],
+                        ),
+                        child: Row(
+                          children: [
+                            if (_maskingBusy || _sharingPhoto)
+                              const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Color(0xFF00E5FF),
+                                ),
+                              )
+                            else
+                              Icon(
+                                _sentisLiveActive || _hasActiveMask
+                                    ? Icons.videocam
+                                    : Icons.center_focus_strong,
+                                size: 16,
+                                color: _sentisLiveActive || _hasActiveMask
+                                    ? const Color(0xFF00E5FF)
+                                    : Colors.white70,
+                              ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                _unityStatus!,
+                                style: const TextStyle(fontSize: 12, color: Colors.white),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
@@ -1031,72 +1039,64 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                   right: 12,
                   child: Row(
                     children: [
-                      if (_lockState == ArLockState.locked) ...[
-                        Expanded(
-                          flex: 3,
-                          child: ElevatedButton.icon(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF00E5FF),
-                              foregroundColor: Colors.black,
-                              padding: const EdgeInsets.symmetric(vertical: 10),
-                            ),
-                            onPressed: _maskingBusy
-                                ? null
-                                : () => _captureAndLockPreview(isUpdate: true),
-                            icon: const Icon(Icons.sync, size: 18),
-                            label: const Text(
-                              'Update view',
-                              style: TextStyle(fontWeight: FontWeight.bold),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF00E5FF),
+                            foregroundColor: Colors.black,
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            elevation: 4,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
                             ),
                           ),
+                          onPressed: (_sharingPhoto || _maskingBusy)
+                              ? null
+                              : () => _captureHdStudioCut(),
+                          icon: Icon(
+                            _sharingPhoto ? Icons.hourglass_top : Icons.camera_alt,
+                            size: 20,
+                          ),
+                          label: Text(
+                            _sharingPhoto
+                                ? 'Capturing HD Studio Cut…'
+                                : 'Capture HD Studio Cut',
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                          ),
                         ),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton.filled(
+                        style: IconButton.styleFrom(
+                          backgroundColor: Colors.black.withValues(alpha: 0.65),
+                          foregroundColor: const Color(0xFF00E5FF),
+                          side: const BorderSide(color: Colors.white38),
+                          padding: const EdgeInsets.all(12),
+                        ),
+                        tooltip: 'Refresh Live Mask',
+                        onPressed: _maskingBusy ? null : () => _refreshLiveMask(),
+                        icon: _maskingBusy
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Color(0xFF00E5FF),
+                                ),
+                              )
+                            : const Icon(Icons.sync, size: 20),
+                      ),
+                      if (_lastGoodPolishedBytes != null) ...[
                         const SizedBox(width: 8),
-                        Expanded(
-                          flex: 2,
-                          child: OutlinedButton.icon(
-                            style: OutlinedButton.styleFrom(
-                              backgroundColor: Colors.black.withValues(alpha: 0.65),
-                              foregroundColor: Colors.white,
-                              side: const BorderSide(color: Colors.white38),
-                              padding: const EdgeInsets.symmetric(vertical: 10),
-                            ),
-                            onPressed: _releaseLock,
-                            icon: const Icon(Icons.lock_open, size: 18),
-                            label: const Text('Release'),
+                        IconButton.filled(
+                          style: IconButton.styleFrom(
+                            backgroundColor: const Color(0xFF1F2430),
+                            foregroundColor: const Color(0xFF00E5FF),
+                            padding: const EdgeInsets.all(12),
                           ),
-                        ),
-                        if (_lastGoodPolishedBytes != null) ...[
-                          const SizedBox(width: 8),
-                          IconButton.filled(
-                            style: IconButton.styleFrom(
-                              backgroundColor: const Color(0xFF1F2430),
-                              foregroundColor: const Color(0xFF00E5FF),
-                            ),
-                            tooltip: 'Save / Share HD Reference',
-                            icon: const Icon(Icons.ios_share, size: 20),
-                            onPressed: () => _showHdShowroomSheet(_lastGoodPolishedBytes!),
-                          ),
-                        ],
-                      ] else ...[
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF00E5FF),
-                              foregroundColor: Colors.black,
-                              padding: const EdgeInsets.symmetric(vertical: 10),
-                            ),
-                            onPressed: _maskingBusy
-                                ? null
-                                : () => _captureAndLockPreview(),
-                            icon: Icon(
-                              _maskingBusy ? Icons.hourglass_top : Icons.lock_outline,
-                              size: 18,
-                            ),
-                            label: Text(
-                              _maskingBusy ? 'Locking showroom preview…' : 'Lock view',
-                              style: const TextStyle(fontWeight: FontWeight.bold),
-                            ),
-                          ),
+                          tooltip: 'View Last HD Cut',
+                          icon: const Icon(Icons.photo_library, size: 20),
+                          onPressed: () => _showHdShowroomSheet(_lastGoodPolishedBytes!),
                         ),
                       ],
                     ],

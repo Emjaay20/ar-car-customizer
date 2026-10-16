@@ -52,21 +52,33 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
     if (this.worker && !this.worker.killed) {
       return this.worker;
     }
+    const metaDir = typeof import.meta.dirname === 'string' ? import.meta.dirname : '';
     const candidates = [
       resolve(process.cwd(), '../ml/live_segment_worker.py'),
       resolve(process.cwd(), 'ml/live_segment_worker.py'),
+      ...(metaDir ? [
+        resolve(metaDir, '../../../ml/live_segment_worker.py'),
+        resolve(metaDir, '../../ml/live_segment_worker.py'),
+      ] : []),
+      '/app/ml/live_segment_worker.py',
+      '/ml/live_segment_worker.py',
     ];
     const scriptPath = candidates.find((p) => existsSync(p));
     if (!scriptPath) {
+      console.warn('[VisionService] live_segment_worker.py not found in candidates:', candidates);
       return null;
     }
 
-    const proc = spawn('python', [scriptPath], {
+    const pythonBin = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
+    console.log(`[VisionService] Spawning Python worker using ${pythonBin} at ${scriptPath}`);
+    const proc = spawn(pythonBin, [scriptPath], {
       cwd: resolve(scriptPath, '..'),
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONUNBUFFERED: '1', YOLO_OFFLINE: 'true' },
     });
-    proc.stderr.on('data', () => {});
+    proc.stderr.on('data', (chunk) => {
+      console.error('[VisionWorker STDERR]', chunk.toString());
+    });
     this.worker = proc;
     this.workerReady = false;
 
@@ -136,7 +148,11 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
   ): Promise<Record<string, unknown>> {
     const proc = this.ensureWorker();
     if (!proc) {
-      return { ok: false, source: 'unavailable', reason: 'live_segment_worker.py not found' };
+      return {
+        ok: false,
+        source: 'unavailable',
+        reason: 'AI Worker unavailable on cloud. Switch to Local PC (192.168.100.66) for real-time AR.',
+      };
     }
     const ready = await this.waitUntilReady(90_000);
     if (!ready || !this.worker || this.worker.killed) {

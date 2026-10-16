@@ -3,11 +3,21 @@ import 'package:graphql_flutter/graphql_flutter.dart';
 import 'auth_session.dart';
 
 class GraphQLService {
-  /// Passed at compile time: flutter run --dart-define=API_URL=http://HOST:3000/graphql
-  static const String apiUrl = String.fromEnvironment(
+  static const String defaultApiUrl = String.fromEnvironment(
     'API_URL',
     defaultValue: 'https://ar-car-backend.aetherhost.com.ng/graphql',
   );
+
+  static String _currentUrl = defaultApiUrl;
+  static String get apiUrl => _currentUrl;
+
+  static final ValueNotifier<GraphQLClient> notifier =
+      ValueNotifier<GraphQLClient>(getClient(apiUrl: defaultApiUrl));
+
+  static void setApiUrl(String newUrl) {
+    _currentUrl = newUrl.trim();
+    notifier.value = getClient(apiUrl: _currentUrl);
+  }
 
   static String resolveUrl(String url, {String? apiUrl}) {
     if (url.startsWith('http://') || url.startsWith('https://')) return url;
@@ -40,6 +50,9 @@ class GraphQLService {
   }
 
   static ValueNotifier<GraphQLClient> getClientNotifier({String? apiUrl}) {
-    return ValueNotifier(getClient(apiUrl: apiUrl));
+    if (apiUrl != null && apiUrl != _currentUrl) {
+      setApiUrl(apiUrl);
+    }
+    return notifier;
   }
 }

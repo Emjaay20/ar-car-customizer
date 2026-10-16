@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:graphql_flutter/graphql_flutter.dart';
 import '../services/auth_session.dart';
+import '../services/graphql_service.dart';
 import 'brand_selection_screen.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -91,6 +92,61 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
+  void _showServerUrlDialog() {
+    final controller = TextEditingController(text: GraphQLService.apiUrl);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Backend Server'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                labelText: 'GraphQL API URL',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.cloud, size: 16),
+              label: const Text('Use Cloud (AetherHost)'),
+              onPressed: () {
+                controller.text = 'https://ar-car-backend.aetherhost.com.ng/graphql';
+              },
+            ),
+            const SizedBox(height: 6),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.wifi, size: 16),
+              label: const Text('Use Local LAN (192.168.100.66)'),
+              onPressed: () {
+                controller.text = 'http://192.168.100.66:3000/graphql';
+              },
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              GraphQLService.setApiUrl(controller.text);
+              Navigator.pop(ctx);
+              setState(() {
+                _error = null;
+              });
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _emailController.dispose();
@@ -102,7 +158,16 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('AR Car Customizer')),
+      appBar: AppBar(
+        title: const Text('AR Car Customizer'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Server Settings',
+            onPressed: _showServerUrlDialog,
+          ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: SingleChildScrollView(
@@ -157,6 +222,34 @@ class _LoginScreenState extends State<LoginScreen> {
               const Text(
                 'Seeded demo account: demo@arcar.com / demo-password',
                 style: TextStyle(color: Colors.grey),
+              ),
+              const SizedBox(height: 16),
+              InkWell(
+                onTap: _showServerUrlDialog,
+                borderRadius: BorderRadius.circular(8),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.white10,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.cloud_done_outlined, size: 16, color: Color(0xFF00E5FF)),
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: Text(
+                          GraphQLService.apiUrl,
+                          style: const TextStyle(fontSize: 12, color: Colors.white70),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      const Icon(Icons.edit, size: 14, color: Colors.white54),
+                    ],
+                  ),
+                ),
               ),
             ],
           ),

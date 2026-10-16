@@ -1,7 +1,10 @@
 My project/
 My/
 client/
-ml/
+ml/out/
+ml/__pycache__/
+ml/*.mp4
+ml/*.jpg
 papers/
 docs/
 scratch/

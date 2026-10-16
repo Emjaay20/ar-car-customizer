@@ -19,7 +19,7 @@ FROM node:22-alpine AS runner
 
 WORKDIR /app
 
-RUN apk add --no-cache openssl libc6-compat curl postgresql postgresql-contrib su-exec
+RUN apk add --no-cache openssl libc6-compat curl postgresql postgresql-contrib su-exec python3 py3-pip py3-numpy py3-opencv
 
 ENV NODE_ENV=production
 ENV PORT=3000
@@ -38,6 +38,8 @@ COPY --from=builder /app/node_modules/@prisma/client ./node_modules/@prisma/clie
 COPY backend/public ./public
 COPY backend/src ./src
 COPY backend/docker-entrypoint.sh ./
+COPY ml ./ml
+COPY ml /ml
 
 RUN chmod +x docker-entrypoint.sh
 

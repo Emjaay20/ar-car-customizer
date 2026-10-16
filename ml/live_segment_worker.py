@@ -12,6 +12,7 @@ import base64
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -23,11 +24,31 @@ DEFAULT_MODEL = "yolov8s-seg.pt" if (Path(__file__).resolve().parent / "yolov8s-
 MODEL_PATH = Path(__file__).resolve().parent / os.environ.get("YOLO_SEG_MODEL", DEFAULT_MODEL)
 PUBLISH_DIR = ROOT / "backend" / "public" / "masks"
 
+PARTS_MODEL_PATH = Path(__file__).resolve().parent / "parts_segmentation.pt"
+PARTS_MODEL: YOLO | None = None
+
+NON_PAINT_PARTS = {
+    'windshield', 'back-windshield',
+    'left_front-window', 'right_front-window',
+    'left_back-window', 'right_back-window',
+    'left_headlight', 'right_headlight',
+    'left_tail-light', 'right_tail-light',
+    'license-plate', 'grille',
+    'left_front-wheel', 'right_front-wheel',
+    'left_back-wheel', 'right_back-wheel'
+}
+
+def get_parts_model() -> YOLO | None:
+    global PARTS_MODEL
+    if PARTS_MODEL is None and PARTS_MODEL_PATH.exists():
+        PARTS_MODEL = YOLO(str(PARTS_MODEL_PATH))
+    return PARTS_MODEL
+
 # Client-owned frame cache keyed by frameId for deterministic, jump-free <20ms repolishing
 FRAME_CACHE: dict[str, dict] = {}
 MAX_FRAME_CACHE = 12
 
-def cache_put_frame(frame_id: str, work_bgr: np.ndarray, paint_u8: np.ndarray, plate_bool: np.ndarray, source: str) -> None:
+def cache_put_frame(frame_id: str, work_bgr: np.ndarray, paint_u8: np.ndarray, plate_bool: np.ndarray, source: str, solid_u8: np.ndarray | None = None) -> None:
     if len(FRAME_CACHE) >= MAX_FRAME_CACHE:
         oldest_id = min(FRAME_CACHE.keys(), key=lambda k: FRAME_CACHE[k].get("ts", 0))
         FRAME_CACHE.pop(oldest_id, None)
@@ -35,6 +56,7 @@ def cache_put_frame(frame_id: str, work_bgr: np.ndarray, paint_u8: np.ndarray, p
         "bgr": work_bgr.copy(),
         "mask_u8": paint_u8.copy(),
         "plate": plate_bool.copy() if plate_bool is not None else np.zeros(paint_u8.shape[:2], dtype=bool),
+        "solid": solid_u8.copy() if solid_u8 is not None else None,
         "source": source,
         "ts": time.time(),
     }
@@ -50,6 +72,7 @@ def cache_get_frame(frame_id: str | None) -> dict | None:
 
 def load_model() -> YOLO:
     target = str(MODEL_PATH if MODEL_PATH.exists() else DEFAULT_MODEL)
+    get_parts_model()
     return YOLO(target)
 
 
@@ -127,10 +150,12 @@ def detect_license_plate_region(
     vert_char = np.maximum(0.0, np.abs(gx) - 0.45 * np.abs(gy))
     vert_energy = cv2.GaussianBlur(vert_char, (19, 5), 0)
 
+    # Plates are strictly center-mounted on bumper and lower down (rel_y in 0.58..0.92, rel_x in 0.34..0.66)
+    # Headlights are on the flanks (rel_x < 0.32 or rel_x > 0.68) or higher up, so they are never checked
     plate_zone = (
         (solid > 0)
-        & (rel_y >= 0.46)
-        & (rel_y <= 0.93)
+        & (rel_y >= 0.58)
+        & (rel_y <= 0.92)
         & (rel_x >= 0.34)
         & (rel_x <= 0.66)
     )
@@ -140,9 +165,9 @@ def detect_license_plate_region(
     zone_thresh = float(np.percentile(vert_energy[plate_zone], 85))
     plate_candidates = (
         plate_zone
-        & (val > 0.24)
-        & (sat < 0.55)
-        & (vert_energy > max(zone_thresh, 0.040))
+        & (val > 0.22)
+        & (sat < 0.50)
+        & (vert_energy > max(zone_thresh, 0.052))
     )
     plate_u8 = cv2.morphologyEx(
         plate_candidates.astype(np.uint8) * 255,
@@ -161,19 +186,20 @@ def detect_license_plate_region(
         px = int(p_st[idx, cv2.CC_STAT_LEFT])
         py = int(p_st[idx, cv2.CC_STAT_TOP])
         aspect = pw / float(max(ph, 1))
+        # Valid automotive license plate aspect ratio: between 1.4 and 4.2
         if (
-            (0.10 * span_x <= pw <= 0.33 * span_x)
-            and (0.045 * span_y <= ph <= 0.20 * span_y)
-            and (1.18 <= aspect <= 4.2)
-            and parea >= max(100, int(0.0045 * span_x * span_y))
+            (0.10 * span_x <= pw <= 0.36 * span_x)
+            and (0.040 * span_y <= ph <= 0.18 * span_y)
+            and (1.40 <= aspect <= 4.2)
+            and parea >= max(100, int(0.004 * span_x * span_y))
         ):
             roi_energy = float(np.mean(vert_energy[py : py + ph, px : px + pw]))
             aspect_fit = 1.0 - min(0.5, abs(aspect - 2.15) * 0.22)
             score = parea * (roi_energy + 0.05) * aspect_fit
             if score > best_score:
                 best_score = score
-                pad_x = max(5, int(round(0.12 * pw)))
-                pad_y = max(4, int(round(0.15 * ph)))
+                pad_x = max(5, int(round(0.10 * pw)))
+                pad_y = max(4, int(round(0.12 * ph)))
                 best_box = (
                     max(0, px - pad_x),
                     max(0, py - pad_y),
@@ -211,8 +237,10 @@ def build_paint_mask(
     frame_bgr: np.ndarray,
     raw_car_mask: np.ndarray,
     return_plate: bool = False,
+    panel: str = "body",
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """Extract clean, hole-free automotive sheet-metal mask with Edge-Aware Guided Filtering and lighting-adaptive cutouts."""
+    """Extract clean, hole-free automotive sheet-metal mask with Edge-Aware Guided Filtering
+    and deep neural car-part segmentations (windshield, headlights, taillights, grille, wheels, license plate)."""
     h, w = raw_car_mask.shape[:2]
     solid = clean_foreground_car_silhouette(raw_car_mask)
 
@@ -222,11 +250,11 @@ def build_paint_mask(
         empty_b = np.zeros((h, w), dtype=bool)
         return (empty_u8, empty_b) if return_plate else empty_u8
 
+    # Edge closure across camera border if vehicle touches edges
     y_min, y_max = int(ys.min()), int(ys.max())
     x_min, x_max = int(xs.min()), int(xs.max())
     span_y = max(y_max - y_min, 1)
     span_x = max(x_max - x_min, 1)
-
     for y in range(y_min, y_max + 1):
         row_xs = np.where(solid[y] > 0)[0]
         if len(row_xs) > 0:
@@ -235,387 +263,75 @@ def build_paint_mask(
             if row_xs[-1] >= w - 7:
                 solid[y, int(row_xs[-1]) :] = 255
 
-    is_cropped_top = y_min <= 8
-    is_closeup_bottom = (y_max >= h - 10) and is_cropped_top
-    if is_closeup_bottom:
-        for x in range(x_min, x_max + 1):
-            col_ys = np.where(solid[int(0.88 * h) :, x] > 0)[0]
-            if len(col_ys) > 0:
-                solid[int(0.88 * h) + int(col_ys[-1]) :, x] = 255
-
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    hue = hsv[:, :, 0].astype(np.float32)
-    sat = hsv[:, :, 1].astype(np.float32) / 255.0
-    val = hsv[:, :, 2].astype(np.float32) / 255.0
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-
-    b_ch = frame_bgr[:, :, 0].astype(np.float32) / 255.0
-    g_ch = frame_bgr[:, :, 1].astype(np.float32) / 255.0
-    r_ch = frame_bgr[:, :, 2].astype(np.float32) / 255.0
-    red_excess = r_ch - 0.5 * (g_ch + b_ch)
-
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    grad = np.sqrt(gx * gx + gy * gy)
-    local_grad = cv2.GaussianBlur(grad, (15, 15), 0)
-    local_val = cv2.GaussianBlur(val, (15, 15), 0)
-
-    yy, xx = np.ogrid[:h, :w]
-    rel_y = (yy - y_min) / float(span_y)
-    rel_x = (xx - x_min) / float(span_x)
-
-    core_zone = (solid > 0) & (rel_y >= 0.36) & (rel_y <= 0.56) & (rel_x >= 0.24) & (rel_x <= 0.76)
-    med_val = float(np.median(val[core_zone])) if np.any(core_zone) else 0.25
-    med_sat = float(np.median(sat[core_zone])) if np.any(core_zone) else 0.15
-    med_grad = float(np.median(local_grad[core_zone])) if np.any(core_zone) else 0.08
-    med_red_excess = float(np.median(red_excess[core_zone])) if np.any(core_zone) else 0.0
-
-    y_probe = min(h - 1, y_min + int(round(0.22 * span_y)))
-    probe_xs = np.where(solid[y_probe] > 0)[0]
-    width_ratio_022 = ((probe_xs[-1] - probe_xs[0]) / float(span_x)) if len(probe_xs) > 10 else 0.0
-    is_wide_side_view = (span_x >= int(0.85 * w)) and (width_ratio_022 > 0.84)
-
-    # Bilateral symmetric side-mirror recovery on front/rear views:
-    # When one side mirror is captured by YOLO (e.g. against dark brick) but the opposite mirror blends into a bright wall,
-    # mirror the detected ear's vertical band and recover matching body-colored mirror pixels on the opposite side.
-    if (not is_wide_side_view) and (not is_cropped_top):
-        ym_top = max(0, y_min + int(round(0.14 * span_y)))
-        ym_bot = min(h - 1, y_min + int(round(0.32 * span_y)))
-        ym_ref = min(h - 1, y_min + int(round(0.33 * span_y)))
-        ref_xs = np.where(solid[ym_ref] > 0)[0]
-        top_xs_m = np.where(solid[ym_top] > 0)[0]
-        if len(ref_xs) > 20 and len(top_xs_m) > 14:
-            for y_m in range(ym_top + 4, ym_bot):
-                r_xs = np.where(solid[y_m] > 0)[0]
-                if len(r_xs) < 14:
-                    continue
-                t_m = (y_m - ym_top) / float(max(ym_ref - ym_top, 1))
-                exp_lx = (1.0 - t_m) * float(top_xs_m[0]) + t_m * float(ref_xs[0])
-                exp_rx = (1.0 - t_m) * float(top_xs_m[-1]) + t_m * float(ref_xs[-1])
-                right_ear = float(r_xs[-1]) - exp_rx
-                left_ear = exp_lx - float(r_xs[0])
-                if right_ear > 0.035 * span_x and left_ear < 0.018 * span_x:
-                    ear_w = int(round(min(right_ear * 1.18, 0.095 * span_x)))
-                    x0_l = max(0, int(round(r_xs[0])) - ear_w)
-                    x1_l = int(round(r_xs[0])) + 2
-                    band_val = val[y_m, x0_l:x1_l]
-                    band_sat = sat[y_m, x0_l:x1_l]
-                    match = (np.abs(band_val - med_val) < 0.28) & (band_sat < max(med_sat + 0.16, 0.26)) & (band_val > 0.35)
-                    if np.any(match):
-                        solid[y_m, x0_l:x1_l][match] = 255
-                elif left_ear > 0.035 * span_x and right_ear < 0.018 * span_x:
-                    ear_w = int(round(min(left_ear * 1.18, 0.095 * span_x)))
-                    x0_r = max(0, int(round(r_xs[-1])) - 1)
-                    x1_r = min(w, int(round(r_xs[-1])) + ear_w)
-                    band_val = val[y_m, x0_r:x1_r]
-                    band_sat = sat[y_m, x0_r:x1_r]
-                    match = (np.abs(band_val - med_val) < 0.28) & (band_sat < max(med_sat + 0.16, 0.26)) & (band_val > 0.35)
-                    if np.any(match):
-                        solid[y_m, x0_r:x1_r][match] = 255
-            solid = cv2.morphologyEx(solid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 5)))
-            ys, xs = np.where(solid > 0)
-            y_min, y_max = int(ys.min()), int(ys.max())
-            x_min, x_max = int(xs.min()), int(xs.max())
-            span_y = max(y_max - y_min, 1)
-            span_x = max(x_max - x_min, 1)
-            rel_y = (yy - y_min) / float(span_y)
-            rel_x = (xx - x_min) / float(span_x)
-
-    license_plate = detect_license_plate_region(
-        solid, val, sat, gx, gy, local_grad, rel_x, rel_y, span_x, span_y, med_grad
-    )
-    plate_ys = np.where(license_plate)[0]
-    plate_rel_cy = ((float(np.mean(plate_ys)) - y_min) / float(span_y)) if len(plate_ys) > 0 else -1.0
-
-    is_red_hue = (hue <= 20.0) | (hue >= 158.0)
-    body_red_fraction = float(np.mean((red_excess[core_zone] > 0.10) & (sat[core_zone] > 0.28))) if np.any(core_zone) else 0.0
-    front_plate_detected = plate_rel_cy > 0.74
-    if body_red_fraction < 0.25 and (not is_wide_side_view) and (not front_plate_detected):
-        raw_taillights = (
-            (solid > 0)
-            & (rel_y >= 0.36)
-            & (rel_y <= 0.66)
-            & ((rel_x <= 0.36) | (rel_x >= 0.64))
-            & (
-                (red_excess > max(med_red_excess + 0.08, 0.09))
-                | (is_red_hue & (sat > max(med_sat + 0.14, 0.22)) & (val > 0.16))
-            )
-        )
-        tl_u8 = cv2.morphologyEx(
-            raw_taillights.astype(np.uint8) * 255,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 13)),
-        )
-        tl_u8 = cv2.dilate(tl_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
-        taillights = (tl_u8 > 0) & (solid > 0)
-    else:
-        taillights = np.zeros((h, w), dtype=bool)
-
-    is_rear_view = (not is_wide_side_view) and (not front_plate_detected) and (
-        (int(np.count_nonzero(taillights)) >= 120) or (0.45 <= plate_rel_cy <= 0.73)
-    )
-    is_front_view = (not is_wide_side_view) and (not is_rear_view)
-
-    cabin_y0 = y_min + int(round(0.052 * span_y))
-    if is_wide_side_view:
-        cabin_y1_ratio = 0.310
-    elif is_rear_view:
-        cabin_y1_ratio = 0.320
-    else:
-        cabin_y1_ratio = 0.306
-    cabin_y1 = y_min + int(round(cabin_y1_ratio * span_y))
-    pillar_inset = 0.080 if is_wide_side_view else 0.060
-
+    # Run neural parts segmentation model on the frame
+    parts_model = get_parts_model()
     cutout = np.zeros((h, w), dtype=np.uint8)
-    prev_lx: float | None = None
-    prev_rx: float | None = None
+    license_plate = np.zeros((h, w), dtype=bool)
+    panel_selected_mask = np.zeros((h, w), dtype=np.uint8) if panel in ("hood", "roof", "doors") else None
 
-    y_left_end = float(cabin_y1)
-    y_right_end = float(cabin_y1)
-    top_center_x = x_min + 0.50 * span_x
+    if parts_model is not None:
+        parts_res = parts_model(frame_bgr, conf=0.18, verbose=False)[0]
+        if parts_res.masks is not None:
+            for i, cls_id in enumerate(parts_res.boxes.cls):
+                part_name = parts_model.names[int(cls_id)]
+                m = parts_res.masks.data[i].cpu().numpy()
+                m_u8 = (cv2.resize(m, (w, h)) > 0.35).astype(np.uint8) * 255
 
-    if is_cropped_top:
-        top_band = solid[y_min : y_min + max(10, int(0.10 * span_y)), :]
-        top_xs = np.where(top_band > 0)[1]
-        if len(top_xs) > 20:
-            top_center_x = float(np.mean(top_xs))
-            if top_center_x < x_min + 0.44 * span_x:
-                y_right_end = min(y_right_end, y_min + 0.275 * span_y)
-            elif top_center_x > x_min + 0.56 * span_x:
-                y_left_end = min(y_left_end, y_min + 0.275 * span_y)
+                # Exclude non-paint regions (windows, lights, grille, wheels, plate)
+                if part_name in NON_PAINT_PARTS:
+                    cutout = cv2.bitwise_or(cutout, m_u8)
+                if part_name == 'license-plate':
+                    license_plate = license_plate | (m_u8 > 0)
 
-    for y in range(cabin_y0, min(cabin_y1 + 1, h)):
-        row_xs = np.where(solid[y] > 0)[0]
-        if len(row_xs) < 14:
-            continue
-        actual_lx = float(np.percentile(row_xs, 1.5))
-        actual_rx = float(np.percentile(row_xs, 98.5))
-        if prev_lx is None or prev_rx is None:
-            lx = actual_lx
-            rx = actual_rx
-        else:
-            # Follow true A-pillar slope (~0.5-1.1 px/row) while ignoring sudden horizontal jumps from side mirrors
-            lx = max(actual_lx, prev_lx - 1.15)
-            rx = min(actual_rx, prev_rx + 1.15)
-        prev_lx = lx
-        prev_rx = rx
+                # Panel gating support (body, hood, roof, doors)
+                if panel_selected_mask is not None:
+                    if panel == "hood" and part_name == "hood":
+                        panel_selected_mask = cv2.bitwise_or(panel_selected_mask, m_u8)
+                    elif panel == "roof" and part_name == "roof":
+                        panel_selected_mask = cv2.bitwise_or(panel_selected_mask, m_u8)
+                    elif panel == "doors" and "door" in part_name:
+                        panel_selected_mask = cv2.bitwise_or(panel_selected_mask, m_u8)
 
-        rw = max(rx - lx, 1.0)
-        gx0 = int(round(lx + pillar_inset * rw))
-        gx1 = int(round(rx - pillar_inset * rw))
-        if gx1 > gx0 + 8:
-            for x in range(max(0, gx0), min(w, gx1)):
-                t = (x - gx0) / float(max(gx1 - gx0, 1))
-                corner_arch = (0.012 * span_y * ((2.0 * t - 1.0) ** 2)) if is_front_view else 0.0
-                y_cowl_at_x = (1.0 - t) * y_left_end + t * y_right_end - corner_arch
-                if y <= int(round(y_cowl_at_x)):
-                    cutout[y, x] = 255
-
-            if is_cropped_top and top_center_x < x_min + 0.44 * span_x and y >= y_min + int(0.10 * span_y):
-                side_win_x0 = int(round(max(0, lx - 0.02 * rw)))
-                side_win_x1 = int(round(lx + 0.06 * rw))
-                if side_win_x1 > side_win_x0 + 4 and y <= int(y_left_end):
-                    cutout[y, max(0, side_win_x0) : min(w, side_win_x1)] = 255
-
-    if np.any(cutout > 0):
-        k_glass = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        cutout = cv2.morphologyEx(cutout, cv2.MORPH_OPEN, k_glass)
-        cutout = cv2.morphologyEx(cutout, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
-
-    # 3. Detect manufacturer emblem/logo (compact central oval badge) and rear chrome trunk garnish bar
-    emblem_y_zone = ((rel_y >= 0.38) & (rel_y <= 0.52)) if is_rear_view else ((rel_y >= 0.57) & (rel_y <= 0.72))
-    emblem_candidates = (
-        (solid > 0)
-        & (not is_wide_side_view)
-        & (rel_x >= 0.43)
-        & (rel_x <= 0.57)
-        & emblem_y_zone
-        & (~license_plate)
-        & (sat < 0.28)
-        & (grad > max(med_grad * 2.3, 0.15))
-    )
-    emblem_u8 = cv2.morphologyEx(
-        emblem_candidates.astype(np.uint8) * 255,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 7)),
-    )
-    e_num, e_lbl, e_st, _ = cv2.connectedComponentsWithStats(emblem_u8, connectivity=8)
-    emblem_cut = np.zeros((h, w), dtype=bool)
-    for idx in range(1, e_num):
-        ew = int(e_st[idx, cv2.CC_STAT_WIDTH])
-        eh = int(e_st[idx, cv2.CC_STAT_HEIGHT])
-        earea = int(e_st[idx, cv2.CC_STAT_AREA])
-        if (0.03 * span_x <= ew <= 0.13 * span_x) and (0.025 * span_y <= eh <= 0.095 * span_y) and earea >= 35:
-            emblem_cut[e_lbl == idx] = True
-
-    if is_rear_view and med_val < 0.56:
-        chrome_trunk_bar = (
-            (solid > 0)
-            & (rel_x >= 0.30)
-            & (rel_x <= 0.70)
-            & (rel_y >= 0.42)
-            & (rel_y <= 0.52)
-            & (~license_plate)
-            & (val > max(med_val + 0.18, 0.56))
-            & (sat < 0.22)
+    # Secondary license plate verification fallback
+    if not np.any(license_plate):
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        val = hsv[:, :, 2].astype(np.float32) / 255.0
+        sat = hsv[:, :, 1].astype(np.float32) / 255.0
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        grad = np.sqrt(gx * gx + gy * gy)
+        local_grad = cv2.GaussianBlur(grad, (15, 15), 0)
+        yy, xx = np.ogrid[:h, :w]
+        rel_y = (yy - y_min) / float(span_y)
+        rel_x = (xx - x_min) / float(span_x)
+        med_grad = float(np.median(local_grad[solid > 0])) if np.any(solid > 0) else 0.08
+        license_plate = detect_license_plate_region(
+            solid, val, sat, gx, gy, local_grad, rel_x, rel_y, span_x, span_y, med_grad
         )
-        cb_u8 = cv2.morphologyEx(
-            chrome_trunk_bar.astype(np.uint8) * 255,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5)),
-        )
-        c_num, c_lbl, c_st, _ = cv2.connectedComponentsWithStats(cb_u8, connectivity=8)
-        for idx in range(1, c_num):
-            cw_bar = int(c_st[idx, cv2.CC_STAT_WIDTH])
-            ch_bar = int(c_st[idx, cv2.CC_STAT_HEIGHT])
-            if cw_bar >= 2.5 * max(ch_bar, 1) and ch_bar <= int(0.06 * span_y):
-                emblem_cut[c_lbl == idx] = True
+        if np.any(license_plate):
+            cutout = cv2.bitwise_or(cutout, license_plate.astype(np.uint8) * 255)
 
-    if is_closeup_bottom:
-        headlights = (
-            (solid > 0)
-            & (rel_y >= 0.77)
-            & (rel_x >= 0.20)
-            & (rel_x <= 0.82)
-            & (
-                (np.abs(local_val - med_val) > 0.14)
-                | ((local_grad > max(med_grad * 2.0, 0.16)) & (rel_y >= 0.80))
-            )
-        )
-        wheels = (
-            (solid > 0)
-            & (rel_y >= 0.78)
-            & (rel_x <= 0.16)
-            & ((local_grad > max(med_grad * 2.1, 0.17)) | (np.abs(local_val - med_val) > 0.16))
-        )
-        lower_cut = ((headlights | wheels | taillights | license_plate | emblem_cut).astype(np.uint8)) * 255
-        lower_cut = cv2.morphologyEx(lower_cut, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)))
+    # Dilate cutouts slightly (3-5px) so paint stops cleanly at rubber gaskets and chrome surrounds
+    k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    cutout_dil = cv2.dilate(cutout, k_dil, iterations=1)
+
+    if panel_selected_mask is not None and np.any(panel_selected_mask > 0):
+        base_paint = cv2.bitwise_and(panel_selected_mask, cv2.bitwise_not(cutout_dil))
     else:
-        # 4. Headlights: anatomically sloped outer lamp corners requiring internal reflector gradient
-        # so shaded white bumper/fender paint at dusk (which is smooth, local_grad < 0.05) is NEVER cut out
-        edge_dist = np.minimum(rel_x, 1.0 - rel_x)
-        hl_y_max = 0.620 + 0.38 * edge_dist
-        if med_val > 0.45:
-            raw_hl = (
-                (solid > 0)
-                & is_front_view
-                & (rel_y >= 0.46)
-                & (rel_y <= hl_y_max)
-                & ((rel_x <= 0.195) | (rel_x >= 0.825))
-                & (local_val < min(med_val - 0.06, 0.48))
-                & (local_grad > max(med_grad * 1.45, 0.088))
-            )
-            hl_u8 = cv2.morphologyEx(
-                raw_hl.astype(np.uint8) * 255,
-                cv2.MORPH_CLOSE,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 11)),
-            )
-            hl_cnts, _ = cv2.findContours(hl_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            hl_filled = np.zeros_like(hl_u8)
-            cv2.drawContours(hl_filled, hl_cnts, -1, 255, thickness=cv2.FILLED)
-            headlights = (hl_filled > 0) & (solid > 0)
-        else:
-            headlights = (
-                (solid > 0)
-                & is_front_view
-                & (rel_y >= 0.46)
-                & (rel_y <= hl_y_max + 0.02)
-                & ((rel_x <= 0.21) | (rel_x >= 0.79))
-                & (local_grad > max(med_grad * 1.75, 0.14))
-                & ((local_val > max(med_val + 0.09, 0.26)) | (local_grad > 0.20))
-            )
-
-        # 5. Front upper radiator grille (dark honeycomb/slat opening between headlights, rel_y in 0.56..0.74)
-        # Clamp after MORPH_CLOSE so the white painted surround around the radiator grille has ZERO white halo
-        if is_front_view:
-            if med_val > 0.45:
-                grille_dark_thresh = min(med_val * 0.52, 0.34)
-                raw_grille = (
-                    (solid > 0)
-                    & (rel_y >= 0.56)
-                    & (rel_y <= 0.74)
-                    & (rel_x >= 0.27)
-                    & (rel_x <= 0.73)
-                    & (val < grille_dark_thresh)
-                )
-                fg_u8 = cv2.morphologyEx(
-                    raw_grille.astype(np.uint8) * 255,
-                    cv2.MORPH_CLOSE,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 13)),
-                )
-                front_grille = (
-                    (fg_u8 > 0)
-                    & (solid > 0)
-                    & ((val < min(med_val * 0.64, 0.42)) | emblem_cut | ((rel_x >= 0.43) & (rel_x <= 0.57) & (rel_y >= 0.57) & (rel_y <= 0.68)))
-                )
-            else:
-                front_grille = (
-                    (solid > 0)
-                    & (rel_y >= 0.56)
-                    & (rel_y <= 0.75)
-                    & (rel_x >= 0.28)
-                    & (rel_x <= 0.72)
-                    & (local_grad > max(med_grad * 1.85, 0.15))
-                )
-        else:
-            front_grille = np.zeros((h, w), dtype=bool)
-
-        # 6. Lower bumper intake slot & fog light bezels:
-        # Anchor threshold to the lower bumper's own median brightness so a shadowed white lower bumper lip at dusk/night stays 100% painted
-        lower_bumper_zone = (solid > 0) & (rel_y >= 0.75) & (~license_plate)
-        lower_med_val = float(np.median(val[lower_bumper_zone])) if np.any(lower_bumper_zone) else med_val
-        intake_dark_thresh = min(lower_med_val * 0.52, 0.20)
-
-        in_lower_slot = (rel_y >= 0.78) & (rel_y <= 0.925) & (rel_x >= 0.24) & (rel_x <= 0.76)
-        in_fog_pocket = (rel_y >= 0.75) & (rel_y <= 0.895) & ((rel_x <= 0.18) | (rel_x >= 0.82))
-        grille_and_underbody = (
-            (solid > 0)
-            & (in_lower_slot | in_fog_pocket)
-            & (
-                ((med_val > 0.45) & (val < intake_dark_thresh))
-                | ((med_val <= 0.45) & (local_grad > max(med_grad * 2.2, 0.16)) & (val < 0.28))
-            )
-        )
-
-        # 7. Circular wheel-arch zones at bottom-left and bottom-right corners (strictly jet-black tire rubber)
-        arch_left = ((rel_x - 0.03) / 0.12) ** 2 + ((rel_y - 0.88) / 0.18) ** 2 <= 1.0
-        arch_right = ((rel_x - 0.97) / 0.12) ** 2 + ((rel_y - 0.88) / 0.18) ** 2 <= 1.0
-        wheels = (
-            (solid > 0)
-            & (arch_left | arch_right)
-            & (local_grad > max(med_grad * 1.85, 0.15))
-            & (val < min(lower_med_val * 0.55, 0.20))
-        )
-
-        lower_cut = (
-            (headlights | front_grille | grille_and_underbody | wheels | taillights | license_plate | emblem_cut).astype(np.uint8)
-        ) * 255
-        k_low = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        lower_cut = cv2.morphologyEx(lower_cut, cv2.MORPH_CLOSE, k_low)
-        lower_cut = cv2.morphologyEx(lower_cut, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-        lower_cut[taillights | license_plate | emblem_cut | headlights | front_grille] = 255
-
-    paint_bin = (solid > 0) & (cutout == 0) & (lower_cut == 0)
-    paint_u8 = (paint_bin.astype(np.uint8)) * 255
-
-    num_l, lbls, st, _ = cv2.connectedComponentsWithStats(paint_u8, connectivity=8)
-    clean_u8 = np.zeros_like(paint_u8)
-    min_island = 85
-    for idx in range(1, num_l):
-        if st[idx, cv2.CC_STAT_AREA] >= min_island:
-            clean_u8[lbls == idx] = 255
-
-    clean_u8 = cv2.morphologyEx(clean_u8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-    clean_u8[taillights | license_plate | emblem_cut | front_grille | headlights] = 0
+        base_paint = cv2.bitwise_and(solid, cv2.bitwise_not(cutout_dil))
 
     # O(N) Edge-Aware Guided Image Filter: snaps mask boundaries to exact image luminance edges
-    # and locks interior sheet-metal alpha to 1.0 (255) so white cars have zero white outline halos
-    clean_f = clean_u8.astype(np.float32) / 255.0
-    guided = guided_filter_mask(gray, clean_f, radius=3, eps=1e-3)
-    sharp_alpha = np.clip((guided - 0.24) / 0.38, 0.0, 1.0)
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    paint_f = base_paint.astype(np.float32) / 255.0
+    guided = guided_filter_mask(gray, paint_f, radius=3, eps=1e-3)
+    sharp_alpha = np.clip((guided - 0.20) / 0.40, 0.0, 1.0)
     solid_f = (solid > 0).astype(np.float32)
     sharp_alpha = np.minimum(sharp_alpha, cv2.GaussianBlur(solid_f, (3, 3), 0))
-    sharp_alpha[license_plate | taillights | emblem_cut] = 0.0
+    sharp_alpha[solid == 0] = 0.0
+    sharp_alpha[cutout > 0] = 0.0
+    if np.any(license_plate):
+        sharp_alpha[license_plate] = 0.0
 
     final_mask = np.clip(sharp_alpha * 255.0, 0, 255).astype(np.uint8)
     if return_plate:
@@ -815,9 +531,14 @@ def studio_polish_car_paint(
     finish: str = "gloss",
     panel: str = "body",
     license_plate: np.ndarray | None = None,
+    solid_silhouette: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Showroom-Grade Dichromatic Reflection + Fresnel Clear-Coat Reconstructor.
-    100% opaque base-coat pigment replacement (zero white bleed-through) with separated glass-like clear-coat reflections."""
+    """Showroom-Grade PBR Automotive Paint Reconstructor:
+    - 100% Opaque Pigment Albedo (zero camera see-through / sunglasses effect)
+    - Ambient + Direct Illumination keeping body color rich and solid (ambient 0.55 - 0.72)
+    - Ambient Occlusion (AO) from bilateral filter preserving crisp mechanical panel seams, door handles, and badges
+    - Dielectric Clearcoat Schlick Fresnel reflection along outer vehicle contours without interior halo
+    """
     hex_clean = (hex_color or "#9B1B30").lstrip("#").strip()
     if len(hex_clean) != 6:
         hex_clean = "9B1B30"
@@ -832,65 +553,110 @@ def studio_polish_car_paint(
     base_bgr = blur_license_plate_privacy(frame_bgr, license_plate)
     img_f = base_bgr.astype(np.float32) / 255.0
     gray = cv2.cvtColor(base_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    h, w = gray.shape[:2]
 
     # Hard-locked interior alpha (1.0 across all sheet metal) with sub-pixel guided edge anti-aliasing
     raw_alpha = mask_u8.astype(np.float32) / 255.0
-    alpha = np.clip((raw_alpha - 0.12) / 0.38, 0.0, 1.0)
+    alpha = np.clip((raw_alpha - 0.10) / 0.35, 0.0, 1.0)
     alpha = apply_panel_gate(alpha, panel)
 
-    car_region = mask_u8 > 80
+    car_region = mask_u8 > 64
     if not np.any(car_region):
         return base_bgr
 
-    norm_shade, micro_detail, spec_layer, fresnel_dome = compute_retinex_intrinsic_shading(gray, car_region, mask_u8)
+    # 1. Bilateral decomposition: separate smooth geometry from sharp creases/panel lines
+    smooth_luma = cv2.bilateralFilter(gray, 9, 0.08, 9.0)
+    crease = np.clip(smooth_luma - gray, 0.0, 1.0)
+    # Ambient Occlusion: shutlines and deep creases drop to 0.30 - 0.45, flat metal stays 1.0
+    ao = np.clip(1.0 - 4.5 * crease, 0.30, 1.0)[:, :, None]
 
+    # 2. Intrinsic car-normalized illumination (Retinex)
+    vals = smooth_luma[car_region]
+    p5 = float(np.percentile(vals, 4))
+    p95 = float(np.percentile(vals, 96))
+    norm_shade = np.clip((smooth_luma - p5) / max(p95 - p5, 0.12), 0.0, 1.0)
+
+    # 3. 3D Outer Silhouette Distance for Fresnel (strictly outer perimeter, NOT internal cutouts!)
+    if solid_silhouette is not None and np.any(solid_silhouette > 0):
+        outer_mask = (solid_silhouette > 0).astype(np.uint8)
+    else:
+        k_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+        outer_mask = cv2.morphologyEx((mask_u8 > 64).astype(np.uint8), cv2.MORPH_CLOSE, k_fill)
+    
+    solid_dist = cv2.distanceTransform(outer_mask, cv2.DIST_L2, 5)
+    max_d = max(float(np.percentile(solid_dist[car_region], 85)), 15.0)
+    norm_dist = np.clip(solid_dist / max_d, 0.0, 1.0)
+    grazing = (1.0 - norm_dist) ** 2.4
+
+    # 4. Finish-specific PBR lighting curves
     finish = (finish or "gloss").lower().strip()
-    if finish == "matte":
-        base_curve = (0.34 + 0.62 * (norm_shade ** 0.92)) * fresnel_dome
-        spec_strength = 0.03
-    elif finish == "satin":
-        base_curve = (0.30 + 0.70 * (norm_shade ** 0.96)) * fresnel_dome
-        spec_strength = 0.14
-    elif finish == "metallic":
-        base_curve = (0.24 + 0.88 * (norm_shade ** 1.02)) * fresnel_dome
-        spec_strength = 0.28
-    elif finish == "candy":
-        # Deep candy tri-coat: rich dark-cherry/candy shadows at grazing angles with luminous saturated highlights
-        base_curve = (0.20 + 0.94 * (norm_shade ** 1.08)) * (fresnel_dome ** 1.15)
-        spec_strength = 0.26
-    else:
-        # Showroom Gloss: deep, saturated base coat with crisp pinpoint clear-coat reflection
-        base_curve = (0.24 + 0.88 * (norm_shade ** 1.02)) * fresnel_dome
-        spec_strength = 0.22
-
     target_luma = 0.114 * b_t + 0.587 * g_t + 0.299 * r_t
-    if target_luma > 0.70:
-        base_curve = (0.52 + 0.48 * (norm_shade ** 0.85)) * fresnel_dome
-        spec_strength *= 0.50
-    elif target_luma < 0.12:
-        # Showroom Obsidian / Jet Black: deep black base coat + real glass-like sky/horizon reflections on the hood
-        base_curve = (0.04 + 0.22 * (norm_shade ** 1.15)) * fresnel_dome
-        spec_strength = 0.04 if finish == "matte" else 0.30
 
-    shading_3d = np.clip(base_curve + micro_detail * 0.95, 0.02, 1.32)[:, :, None]
-    if target_luma < 0.12:
-        jet_tint = np.maximum(target_bgr, np.array([0.09, 0.085, 0.08], dtype=np.float32))
-        diffuse_paint = jet_tint[None, None, :] * shading_3d
-        # On Gloss Black, broad horizon/sky clear-coat reflections give real automotive glass depth
-        coat_mask = (spec_layer ** 1.30)[:, :, None]
-        spec_tint = np.array([1.04, 1.00, 0.96], dtype=np.float32)
-        specular_add = coat_mask * spec_tint[None, None, :] * spec_strength
-        sky_reflect = img_f * (coat_mask * (0.02 if finish == "matte" else 0.14))
-        painted_bgr = np.clip(diffuse_paint + specular_add + sky_reflect, 0.0, 1.0)
+    if finish == "matte":
+        ambient_floor = 0.68
+        direct_scale = 0.40
+        clearcoat_f0 = 0.01
+        clearcoat_grazing = 0.08
+        spec_power = 8.0
+    elif finish == "satin":
+        ambient_floor = 0.62
+        direct_scale = 0.48
+        clearcoat_f0 = 0.02
+        clearcoat_grazing = 0.18
+        spec_power = 16.0
+    elif finish == "metallic":
+        ambient_floor = 0.58
+        direct_scale = 0.54
+        clearcoat_f0 = 0.04
+        clearcoat_grazing = 0.32
+        spec_power = 32.0
+    elif finish == "candy":
+        ambient_floor = 0.50
+        direct_scale = 0.68
+        clearcoat_f0 = 0.04
+        clearcoat_grazing = 0.38
+        spec_power = 48.0
     else:
-        # On Colored Paints (Candy Red, Carmine Red, Blue, etc.), keep 100% pure chromatic saturation across midtones
-        # and restrict white specular glints strictly to pinpoint highlights (spec_layer ** 2.4) so paint is NEVER see-through or pink!
-        diffuse_paint = target_bgr[None, None, :] * shading_3d
-        pinpoint_glint = (np.clip((norm_shade - 0.74) / 0.26, 0.0, 1.0) ** 2.4)[:, :, None]
-        spec_tint = 0.38 * np.ones(3, dtype=np.float32) + 0.62 * target_bgr
-        specular_add = pinpoint_glint * spec_tint[None, None, :] * spec_strength
-        painted_bgr = np.clip(diffuse_paint + specular_add, 0.0, 1.0)
+        # Showroom Gloss
+        ambient_floor = 0.56
+        direct_scale = 0.54
+        clearcoat_f0 = 0.03
+        clearcoat_grazing = 0.32
+        spec_power = 32.0
 
+    # Luma adjustments for Obsidian Black and Pure White
+    if target_luma < 0.12:
+        ambient_floor = 0.14
+        direct_scale = 0.26
+        clearcoat_f0 = 0.05
+        clearcoat_grazing = 0.45
+        effective_tint = np.maximum(target_bgr, np.array([0.08, 0.08, 0.08], dtype=np.float32))
+    elif target_luma > 0.72:
+        ambient_floor = 0.72
+        direct_scale = 0.38
+        effective_tint = target_bgr
+    else:
+        effective_tint = target_bgr
+
+    # Diffuse Basecoat: 100% opaque pigment illumination modulated by AO
+    base_illum = ambient_floor + direct_scale * (norm_shade ** 0.88)
+    diffuse_layer = effective_tint[None, None, :] * base_illum[:, :, None] * ao
+
+    # Clearcoat Specular + Fresnel Reflection Layer
+    direct_glint = (np.clip((norm_shade - 0.68) / 0.32, 0.0, 1.0) ** (spec_power / 14.0))[:, :, None]
+    fresnel_sheen = (clearcoat_f0 + (clearcoat_grazing - clearcoat_f0) * grazing)[:, :, None]
+    
+    # Specular clearcoat color (neutral white / light sky)
+    clearcoat_color = np.array([1.0, 0.98, 0.96], dtype=np.float32)
+    specular_layer = clearcoat_color[None, None, :] * (direct_glint * 0.40 + fresnel_sheen * 0.45)
+
+    if finish == "metallic":
+        flake = (np.abs(smooth_luma - gray) * 3.5)[:, :, None]
+        diffuse_layer = diffuse_layer * (1.0 + np.clip(flake, 0.0, 0.30))
+
+    painted_bgr = np.clip(diffuse_layer + specular_layer, 0.0, 1.0)
+
+    # Composite: mask alpha anti-aliasing strictly at the edge, solid 100% inside
     a3 = alpha[:, :, None]
     comp = (1.0 - a3) * img_f + a3 * painted_bgr
     return np.clip(comp * 255.0, 0, 255).astype(np.uint8)
@@ -935,7 +701,7 @@ def process_frame(
         result = model.predict(
             work_bgr,
             classes=[2, 5, 7],
-            conf=0.10,
+            conf=0.08,
             retina_masks=True,
             verbose=False,
         )[0]
@@ -945,7 +711,7 @@ def process_frame(
             return {"ok": False, "reason": "Point camera clearly at a vehicle to lock live paint mask"}
 
         source = "yolov8s-seg-hd" if hd_mode else "yolov8s-seg"
-        paint_u8, plate_bool = build_paint_mask(work_bgr, primary_mask, return_plate=True)
+        paint_u8, plate_bool = build_paint_mask(work_bgr, primary_mask, return_plate=True, panel=panel)
 
         # Multi-frame temporal consensus against previous cached frame when IoU >= 0.82
         prev_cached = cache_get_frame(None)
@@ -954,7 +720,7 @@ def process_frame(
             prev_b = prev_cached["mask_u8"] > 64
             inter = int(np.count_nonzero(curr_b & prev_b))
             union = int(np.count_nonzero(curr_b | prev_b))
-            if union > 0 and (inter / float(union)) >= 0.82:
+            if union > 0 and (inter / float(union)) >= 0.722:
                 paint_u8 = np.clip(
                     0.75 * paint_u8.astype(np.float32) + 0.25 * prev_cached["mask_u8"].astype(np.float32),
                     0,
@@ -963,8 +729,9 @@ def process_frame(
                 paint_u8[plate_bool] = 0
 
         effective_frame_id = frame_id if frame_id else f"frame_{int(time.time() * 1000)}"
-        cache_put_frame(effective_frame_id, work_bgr, paint_u8, plate_bool, source)
+        cache_put_frame(effective_frame_id, work_bgr, paint_u8, plate_bool, source, solid_u8=primary_mask)
 
+    solid_silhouette = cached.get("solid") if (repolish_only and cached is not None) else locals().get("primary_mask", None)
     polished_bgr = studio_polish_car_paint(
         work_bgr,
         paint_u8,
@@ -972,6 +739,7 @@ def process_frame(
         finish=finish,
         panel=panel,
         license_plate=plate_bool,
+        solid_silhouette=solid_silhouette,
     )
     intrinsic_mask_bgr = encode_intrinsic_mask_bgr(work_bgr, paint_u8, plate_bool)
 
@@ -1019,7 +787,7 @@ def identify_vehicle(model: YOLO, image_b64: str) -> dict:
     result = model.predict(
         work_bgr,
         classes=[2, 5, 7],
-        conf=0.10,
+        conf=0.08,
         retina_masks=True,
         verbose=False,
     )[0]

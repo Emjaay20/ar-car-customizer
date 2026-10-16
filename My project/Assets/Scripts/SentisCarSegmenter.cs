@@ -108,12 +108,12 @@ public class SentisCarSegmenter : MonoBehaviour
                         hasMovedSinceSettle = true;
                     }
 
-                    // If user pans significantly and not locked, clear the stale angle mask
-                    var filter = LiveCarFilter.Ensure(cam);
-                    if (externalMaskActive && filter != null && !filter.IsLocked && (angleFromSettled > largePanAngleThreshold || distFromSettled > largePanDistThreshold))
+                    // When user moves/pans camera, seamlessly request an updated mask while holding current mask
+                    if (externalMaskActive && (angleFromSettled > largePanAngleThreshold || distFromSettled > largePanDistThreshold))
                     {
-                        externalMaskActive = false;
-                        filter.SetMask(null);
+                        lastSettledPos = curPos;
+                        lastSettledRot = curRot;
+                        Report("SENTIS_NEEDS_MASK");
                     }
 
                     float frameAngleDelta = Quaternion.Angle(curRot, prevRot);

@@ -15,6 +15,7 @@ public class BuildCommand
 
         EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.Android, BuildTarget.Android);
         EditorUserBuildSettings.exportAsGoogleAndroidProject = true;
+        PlayerSettings.SetManagedStrippingLevel(UnityEditor.Build.NamedBuildTarget.Android, ManagedStrippingLevel.Minimal);
         // The phone loads GLBs from the LAN backend over http://. Unity blocks that
         // unless this is AlwaysAllowed, and the value is baked in at export time.
         PlayerSettings.insecureHttpOption = InsecureHttpOption.AlwaysAllowed;
