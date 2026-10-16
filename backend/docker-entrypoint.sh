@@ -23,6 +23,8 @@ if [ -z "$DATABASE_URL" ] || echo "$DATABASE_URL" | grep -q -E "localhost|127.0.
   export DATABASE_URL="postgresql://admin:adminpassword@127.0.0.1:5432/ar_car_customizer?schema=public"
 fi
 
+export JWT_SECRET="${JWT_SECRET:-ar-car-secret-key-aetherhost-production}"
+
 echo "Running Prisma migrations..."
 npx prisma db push --accept-data-loss || true
 

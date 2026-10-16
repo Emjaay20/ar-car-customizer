@@ -23,6 +23,7 @@ RUN apk add --no-cache openssl libc6-compat curl postgresql postgresql-contrib s
 
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV JWT_SECRET="ar-car-secret-key-aetherhost-production"
 ENV PATH="/app/node_modules/.bin:$PATH"
 
 COPY package*.json ./
