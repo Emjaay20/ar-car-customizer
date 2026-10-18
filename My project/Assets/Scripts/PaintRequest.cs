@@ -47,12 +47,13 @@ public class PaintRequest
     {
         if (string.IsNullOrEmpty(value)) return "gloss";
         var token = value.ToLowerInvariant();
-        if (token == "gloss" || token == "matte" || token == "satin" || token == "metallic" || token == "candy")
+        if (token == "gloss" || token == "matte" || token == "satin" || token == "metallic" || token == "candy" || token == "carbon")
             return token;
         if (token.Contains("matte")) return "matte";
         if (token.Contains("satin")) return "satin";
         if (token.Contains("metallic") || token.Contains("metal")) return "metallic";
         if (token.Contains("candy")) return "candy";
+        if (token.Contains("carbon")) return "carbon";
         if (token.Contains("gloss")) return "gloss";
         return "gloss";
     }
@@ -62,6 +63,7 @@ public class PaintRequest
         if (string.IsNullOrEmpty(value)) return "body";
         var token = value.ToLowerInvariant();
         if (token == "door" || token == "doors") return "doors";
+        if (token == "mirror" || token == "mirrors") return "mirrors";
         if (token == "hood" || token == "roof" || token == "body") return token;
         return "body";
     }
@@ -78,6 +80,8 @@ public class PaintRequest
                 return new PaintFinishValues(0.92f, 0.76f, 0.95f);
             case "candy":
                 return new PaintFinishValues(0.42f, 0.92f, 0.96f);
+            case "carbon":
+                return new PaintFinishValues(0.85f, 0.88f, 0.98f);
             default:
                 return new PaintFinishValues(0.10f, 0.90f, 0.95f);
         }
@@ -90,6 +94,7 @@ public class PaintRequest
             case "hood": return 1f;
             case "roof": return 2f;
             case "doors": return 3f;
+            case "mirrors": return 4f;
             default: return 0f;
         }
     }

@@ -1,5 +1,7 @@
 using UnityEditor;
 using UnityEngine;
+using Unity.InferenceEngine;
+using System;
 using System.IO;
 
 /// <summary>
@@ -8,6 +10,80 @@ using System.IO;
 /// </summary>
 public class BuildCommand
 {
+    static void VerifySentisModelInUnity(string projectRoot)
+    {
+        AssetDatabase.Refresh();
+        var modelAsset = Resources.Load<ModelAsset>("CarSegMask");
+        if (modelAsset == null)
+            throw new Exception("[VerifySentis] CarSegMask ModelAsset is null in Resources!");
+
+        var model = ModelLoader.Load(modelAsset);
+        using var worker = new Worker(model, BackendType.CPU);
+        using var blankTensor = new Tensor<float>(new TensorShape(1, 3, 256, 256));
+        worker.Schedule(blankTensor);
+        var blankOut = (worker.PeekOutput() as Tensor<float>).ReadbackAndClone();
+        float blankMax = 0f;
+        for (int i = 0; i < blankOut.count; i++)
+            if (blankOut[i] > blankMax) blankMax = blankOut[i];
+        blankOut.Dispose();
+        Debug.Log($"[VerifySentis] Blank 256x256 tensor max = {blankMax:F5}");
+        if (blankMax > 0.05f)
+            throw new Exception($"[VerifySentis] Blank tensor max too high: {blankMax}");
+
+        string[] testFrames = { "frame_0000.jpg", "frame_1040.jpg", "frame_1300.jpg" };
+        foreach (var fname in testFrames)
+        {
+            string fpath = Path.Combine(projectRoot, "scratch", "eval_085711", fname);
+            if (!File.Exists(fpath)) continue;
+            byte[] bytes = File.ReadAllBytes(fpath);
+            var tex = new Texture2D(2, 2);
+            tex.LoadImage(bytes);
+
+            // Crop top half (Unity viewport) and resize to 256x256 on CPU to verify worker execution in batchmode
+            using var imgTensor = new Tensor<float>(new TensorShape(1, 3, 256, 256));
+            int cropH = tex.height / 2;
+            for (int y = 0; y < 256; y++)
+            {
+                // y=0 is top of image; Texture2D.GetPixelBilinear has v=1 at top, v=0.5 at middle of full screenshot
+                float v = 1.0f - (y / 255.0f) * 0.5f;
+                for (int x = 0; x < 256; x++)
+                {
+                    float u = x / 255.0f;
+                    Color c = tex.GetPixelBilinear(u, v);
+                    imgTensor[0, 0, y, x] = c.r;
+                    imgTensor[0, 1, y, x] = c.g;
+                    imgTensor[0, 2, y, x] = c.b;
+                }
+            }
+            UnityEngine.Object.DestroyImmediate(tex);
+
+            worker.Schedule(imgTensor);
+            using var outClone = (worker.PeekOutput() as Tensor<float>).ReadbackAndClone();
+            float maxVal = 0f, sumVal = 0f;
+            int activeCount = 0;
+            for (int i = 0; i < outClone.count; i++)
+            {
+                float val = outClone[i];
+                if (val > maxVal) maxVal = val;
+                sumVal += val;
+                if (val > 0.25f) activeCount++;
+            }
+            float meanVal = sumVal / outClone.count;
+            float cov = (activeCount * 100f) / outClone.count;
+            Debug.Log($"[VerifySentis] {fname}: max={maxVal:F4}, mean={meanVal:F4}, coverage={cov:F1}%");
+            if (maxVal < 0.8f || cov < 10f)
+                throw new Exception($"[VerifySentis] Failed detection on {fname}: max={maxVal}, cov={cov}%");
+        }
+        Debug.Log("[VerifySentis] All Unity Sentis CPU inference checks PASSED!");
+    }
+
+    [MenuItem("Flutter/Verify Sentis Model")]
+    public static void VerifySentisMenu()
+    {
+        string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, "..", ".."));
+        VerifySentisModelInUnity(projectRoot);
+    }
+
     [MenuItem("Flutter/Export Android for Flutter")]
     public static void PerformAndroidExport()
     {

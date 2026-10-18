@@ -5,7 +5,7 @@ Shader "ARCar/LivePaint"
         _MaskTex ("Segmentation mask", 2D) = "black" {}
         _SceneTex ("Live camera scene", 2D) = "black" {}
         _Tint ("Tint", Color) = (0.61, 0.11, 0.19, 1)
-        _Strength ("Strength", Range(0, 1)) = 0
+        _Strength ("Strength", Range(0, 1)) = 1.0
         _Metallic ("Metallic", Range(0, 1)) = 0.08
         _Smoothness ("Smoothness", Range(0, 1)) = 0.92
         _Panel ("Panel", Float) = 0
@@ -66,21 +66,29 @@ Shader "ARCar/LivePaint"
 
             float PanelGate(float2 uv, float panel)
             {
-                // Body (panel 0): paint 100% of the segmented sheet-metal mask
+                // Body (panel 0): 100% full vehicle wrap
                 if (panel < 0.5) return 1.0;
-                // Approximate region gates until part-level segmentation is active
+                // Hood (panel 1): center mid-lower sheet metal (hood / bonnet)
                 if (panel < 1.5)
                 {
-                    return smoothstep(0.28, 0.38, uv.y) * smoothstep(0.66, 0.56, uv.y)
-                        * smoothstep(0.18, 0.28, uv.x) * smoothstep(0.82, 0.72, uv.x);
+                    return smoothstep(0.44, 0.54, uv.y) * smoothstep(0.78, 0.68, uv.y)
+                         * smoothstep(0.20, 0.30, uv.x) * smoothstep(0.80, 0.70, uv.x);
                 }
+                // Two-Tone Floating Roof (panel 2): upper cabin sheet metal (roof & pillars)
                 if (panel < 2.5)
                 {
-                    return smoothstep(0.55, 0.65, uv.y)
-                        * smoothstep(0.20, 0.30, uv.x) * smoothstep(0.80, 0.70, uv.x);
+                    return smoothstep(0.16, 0.26, uv.y) * smoothstep(0.48, 0.38, uv.y)
+                         * smoothstep(0.22, 0.32, uv.x) * smoothstep(0.78, 0.68, uv.x);
                 }
-                float side = max(smoothstep(0.42, 0.28, uv.x), smoothstep(0.58, 0.72, uv.x));
-                return side * smoothstep(0.20, 0.30, uv.y) * smoothstep(0.68, 0.56, uv.y);
+                // Doors (panel 3): left and right sides
+                if (panel < 3.5)
+                {
+                    float side = max(smoothstep(0.42, 0.28, uv.x), smoothstep(0.58, 0.72, uv.x));
+                    return side * smoothstep(0.25, 0.35, uv.y) * smoothstep(0.75, 0.65, uv.y);
+                }
+                // Mirrors & Accents (panel 4): outer mid sides
+                float mirrorSide = max(smoothstep(0.25, 0.12, uv.x), smoothstep(0.75, 0.88, uv.x));
+                return mirrorSide * smoothstep(0.32, 0.42, uv.y) * smoothstep(0.62, 0.52, uv.y);
             }
 
             half3 SampleBlurredPlate(float2 screenUV, float2 uv)
@@ -102,71 +110,81 @@ Shader "ARCar/LivePaint"
                 return acc / 25.0;
             }
 
-            half3 ShadePaint(float3 maskSample, float3 scene)
+            half3 ShadePaint(float3 maskSample, float3 scene, float2 uv)
             {
                 float mask = maskSample.r;
-                float intrinsicShade = maskSample.g;
-                float intrinsicSpec = maskSample.b;
 
-                // 1. Live camera crease / shutline Ambient Occlusion (AO)
-                // Preserves deep door seams, hood gaps, badges without cartoon outlines
-                float luma = dot(scene, float3(0.2126, 0.7152, 0.0722));
-                float lumaDx = ddx(luma);
-                float lumaDy = ddy(luma);
-                float crease = saturate(sqrt(lumaDx * lumaDx + lumaDy * lumaDy) * 4.5);
-                float ao = clamp(1.0 - crease * 0.75, 0.30, 1.0);
-
-                // 2. Car-normalized 3D shading derived directly from the live 60 FPS camera feed
-                // Preserves dynamic live lighting, shadows, and reflections without baking stale snapshot ghosting
-                float normShade = smoothstep(0.06, 0.90, luma);
-
-                // 3. 3D Surface normal & geometric grazing sheen
-                float2 gradient = float2(ddx(mask), ddy(mask));
-                float edgeGrad = length(gradient) * 3.5;
-                float grazing = saturate(edgeGrad);
-
-                // 4. PBR Finish-dependent parameters
-                float paintLuma = dot(_Tint.rgb, float3(0.2126, 0.7152, 0.0722));
+                // 1. Scene luminance and lighting gradient
+                float rawLuma = dot(scene, float3(0.299, 0.587, 0.114));
                 
-                float ambientFloor = lerp(0.68, 0.55, _Smoothness);
-                float directScale = lerp(0.36, 0.54, _Smoothness);
-                float clearcoatF0 = 0.03;
-                float clearcoatGrazing = lerp(0.10, 0.38, _Smoothness);
-                float specPower = lerp(12.0, 64.0, _Smoothness);
+                // Top-to-bottom macro 3D lighting gradient (sky illumination -> ground)
+                float macroLight = lerp(0.88, 1.08, saturate(1.0 - uv.y * 0.75));
+                
+                // Gentle macro scene lighting modulation (smooth ambient adaptation, +/- 12%)
+                // Clamped so dark dirt, water stains, and scratches on the underlying car NEVER bleed through!
+                float sceneLight = lerp(0.88, 1.12, smoothstep(0.22, 0.78, rawLuma));
+
+                // 2. Crisp mechanical panel seams (door shutlines, hood gaps)
+                // Filtered with a threshold so surface blemishes/dirt (gradient < 0.14) do NOT trigger shadow
+                float lumaDx = ddx(rawLuma);
+                float lumaDy = ddy(rawLuma);
+                float grad = sqrt(lumaDx * lumaDx + lumaDy * lumaDy);
+                float seam = saturate((grad - 0.13) * 4.5);
+                float ao = clamp(1.0 - seam * 0.32, 0.68, 1.0);
+
+                // 3. PBR Finish-dependent parameters
+                float paintLuma = dot(_Tint.rgb, float3(0.299, 0.587, 0.114));
+                
+                float clearcoatF0 = 0.04;
+                float clearcoatGrazing = lerp(0.18, 0.48, _Smoothness);
+                float specPower = lerp(16.0, 72.0, _Smoothness);
 
                 if (paintLuma < 0.12)
                 {
-                    // Showroom Obsidian / Gloss Black: deep base + glass-like clearcoat
-                    ambientFloor = 0.14;
-                    directScale = 0.26;
-                    clearcoatF0 = 0.05;
-                    clearcoatGrazing = 0.45;
+                    // Showroom Obsidian / Gloss Black:
+                    // Rich deep black pigment + glass-like specular & environment reflections
+                    clearcoatF0 = 0.06;
+                    clearcoatGrazing = 0.60;
                 }
                 else if (paintLuma > 0.72)
                 {
                     // Metallic Silver / Pure White
-                    ambientFloor = 0.72;
-                    directScale = 0.38;
+                    clearcoatF0 = 0.03;
+                    clearcoatGrazing = 0.32;
                 }
 
-                half3 effectiveTint = (paintLuma < 0.12) ? max(_Tint.rgb, half3(0.08, 0.08, 0.08)) : _Tint.rgb;
+                half3 effectiveTint = (paintLuma < 0.12) ? max(_Tint.rgb, half3(0.07, 0.07, 0.07)) : _Tint.rgb;
 
-                // Diffuse basecoat: 100% solid pigment, modulated by normalized lighting & AO
-                float baseIllum = ambientFloor + directScale * pow(saturate(normShade), 0.88);
-                half3 diffuse = effectiveTint * (baseIllum * ao);
+                // 4. 100% Opaque Pigment Vinyl Basecoat: completely covers blemishes, scratches, and old paint!
+                float totalIllum = macroLight * sceneLight;
+                half3 diffuse = effectiveTint * (0.45 * _AmbientLightColor.rgb + 0.55 * totalIllum) * ao;
 
-                // Clearcoat dielectric specular reflection (Schlick Fresnel approximation)
-                float directGlint = pow(saturate((normShade - 0.66) / 0.34), specPower / 14.0);
-                float fresnelSheen = clearcoatF0 + (clearcoatGrazing - clearcoatF0) * grazing;
-                
-                half3 clearcoatColor = half3(1.0, 0.98, 0.96);
-                half3 specular = clearcoatColor * (directGlint * 0.38 + fresnelSheen * 0.40);
+                // 5. Dielectric Clearcoat Specular Highlight & Sky Fresnel Reflection (Additive)
+                float2 maskGrad = float2(ddx(mask), ddy(mask));
+                float edgeCurvature = saturate(length(maskGrad) * 4.5);
+                float fresnel = clearcoatF0 + (clearcoatGrazing - clearcoatF0) * pow(edgeCurvature, 1.25);
 
+                // Sun / overhead light specular glint
+                float directGlint = pow(saturate((rawLuma - 0.62) / 0.38), specPower / 6.0);
+                half3 glintColor = half3(1.0, 0.99, 0.97) * directGlint * 0.65;
+
+                // Environment sky reflection along vehicle curvature
+                half3 envReflect = scene * fresnel * 0.90;
+                half3 specular = (glintColor + envReflect) * _Smoothness;
+
+                // Metallic flake micro-sparkle in midtones
                 if (_Metallic > 0.25)
                 {
-                    // Metallic flake micro-sparkle in midtones
-                    float flake = saturate(abs(lumaDx) + abs(lumaDy)) * _Metallic * 0.40;
+                    float flake = saturate(abs(lumaDx) + abs(lumaDy)) * _Metallic * 0.35;
                     diffuse *= (1.0 + flake);
+                }
+
+                // Procedural Carbon Fiber weave if finish is carbon
+                if (_Metallic > 0.80 && _Smoothness > 0.85 && _Metallic < 0.90)
+                {
+                    float2 carbonUV = frac(uv * 140.0);
+                    float carbonWeave = ((carbonUV.x > 0.5) ^ (carbonUV.y > 0.5)) ? 0.84 : 1.16;
+                    diffuse *= carbonWeave;
                 }
 
                 return saturate(diffuse + specular);
@@ -193,21 +211,18 @@ Shader "ARCar/LivePaint"
                 }
 
                 float mask = maskSample.r * PanelGate(input.uv, _Panel);
-                if (mask < 0.02) discard;
+                // Cutoff uncertain noise while ensuring full sheet metal coverage
+                if (mask < 0.10) discard;
 
                 float3 opaqueScene = SampleSceneColor(screenUV);
                 float3 camScene = SAMPLE_TEXTURE2D(_SceneTex, sampler_SceneTex, input.uv).rgb;
                 float3 scene = max(opaqueScene, camScene);
 
-                half3 paintRgb = ShadePaint(maskSample, scene);
+                half3 paintRgb = ShadePaint(maskSample, scene, input.uv);
 
-                // Solid paint: 100% solid core across all sheet metal (zero see-through)
-                // Sub-pixel anti-aliasing strictly at the mask perimeter
-                float edgeAA = smoothstep(0.02, 0.14, mask);
-                float solidCore = smoothstep(0.16, 0.30, mask);
-                float effectiveStrength = (_Strength > 0.01) ? 1.0 : 0.0;
-                float alpha = saturate(lerp(edgeAA, 1.0, solidCore) * effectiveStrength);
-                if (alpha < 0.004) discard;
+                // Full sheet metal coverage up to rubber gaskets with smooth anti-aliased edge
+                float alpha = smoothstep(0.12, 0.35, mask) * ((_Strength > 0.01) ? 1.0 : 0.0);
+                if (alpha < 0.005) discard;
 
                 return half4(paintRgb, alpha);
             }
@@ -255,16 +270,21 @@ Shader "ARCar/LivePaint"
                 if (panel < 0.5) return 1.0;
                 if (panel < 1.5)
                 {
-                    return smoothstep(0.28, 0.38, uv.y) * smoothstep(0.66, 0.56, uv.y)
-                        * smoothstep(0.18, 0.28, uv.x) * smoothstep(0.82, 0.72, uv.x);
+                    return smoothstep(0.44, 0.54, uv.y) * smoothstep(0.78, 0.68, uv.y)
+                         * smoothstep(0.20, 0.30, uv.x) * smoothstep(0.80, 0.70, uv.x);
                 }
                 if (panel < 2.5)
                 {
-                    return smoothstep(0.55, 0.65, uv.y)
-                        * smoothstep(0.20, 0.30, uv.x) * smoothstep(0.80, 0.70, uv.x);
+                    return smoothstep(0.16, 0.26, uv.y) * smoothstep(0.48, 0.38, uv.y)
+                         * smoothstep(0.22, 0.32, uv.x) * smoothstep(0.78, 0.68, uv.x);
                 }
-                float side = max(smoothstep(0.42, 0.28, uv.x), smoothstep(0.58, 0.72, uv.x));
-                return side * smoothstep(0.20, 0.30, uv.y) * smoothstep(0.68, 0.56, uv.y);
+                if (panel < 3.5)
+                {
+                    float side = max(smoothstep(0.42, 0.28, uv.x), smoothstep(0.58, 0.72, uv.x));
+                    return side * smoothstep(0.25, 0.35, uv.y) * smoothstep(0.75, 0.65, uv.y);
+                }
+                float mirrorSide = max(smoothstep(0.25, 0.12, uv.x), smoothstep(0.75, 0.88, uv.x));
+                return mirrorSide * smoothstep(0.32, 0.42, uv.y) * smoothstep(0.62, 0.52, uv.y);
             }
 
             v2f vert(appdata input)
@@ -293,28 +313,28 @@ Shader "ARCar/LivePaint"
                 }
 
                 float mask = maskSample.r * PanelGate(input.uv, _Panel);
-                if (mask < 0.02) discard;
+                if (mask < 0.10) discard;
 
                 float3 scene = tex2D(_SceneTex, input.uv).rgb;
-                float luma = dot(scene, float3(0.2126, 0.7152, 0.0722));
-                float normShade = smoothstep(0.06, 0.90, luma);
+                float rawLuma = dot(scene, float3(0.299, 0.587, 0.114));
 
-                float paintLuma = dot(_Tint.rgb, float3(0.2126, 0.7152, 0.0722));
-                float ambientFloor = (paintLuma < 0.12) ? 0.14 : lerp(0.68, 0.55, _Smoothness);
-                float directScale = (paintLuma < 0.12) ? 0.26 : lerp(0.36, 0.54, _Smoothness);
-                fixed3 baseTint = (paintLuma < 0.12) ? max(_Tint.rgb, fixed3(0.08, 0.08, 0.08)) : _Tint.rgb;
-                
-                float baseIllum = ambientFloor + directScale * pow(saturate(normShade), 0.88);
-                fixed3 diffuse = baseTint * baseIllum;
+                float macroLight = lerp(0.85, 1.15, saturate(1.0 - input.uv.y * 0.75));
+                float sceneLight = lerp(0.85, 1.15, smoothstep(0.22, 0.78, rawLuma));
 
-                float directGlint = pow(saturate((normShade - 0.66) / 0.34), lerp(1.2, 4.0, _Smoothness));
-                fixed3 specColor = fixed3(1.0, 0.98, 0.96) * directGlint * _Smoothness * 0.35;
+                float paintLuma = dot(_Tint.rgb, float3(0.299, 0.587, 0.114));
+                fixed3 baseTint = (paintLuma < 0.12) ? max(_Tint.rgb, fixed3(0.07, 0.07, 0.07)) : _Tint.rgb;
 
-                float edgeAA = smoothstep(0.02, 0.14, mask);
-                float solidCore = smoothstep(0.16, 0.30, mask);
-                float alpha = saturate(lerp(edgeAA, 1.0, solidCore) * ((_Strength > 0.01) ? 1.0 : 0.0));
-                if (alpha < 0.004) discard;
-                return fixed4(saturate(diffuse + specColor), alpha);
+                // 100% Opaque Pigment Vinyl Basecoat
+                fixed3 diffuse = baseTint * (macroLight * sceneLight * 0.90);
+
+                // Dielectric Specular Glint & Environmental Sheen (Additive)
+                float directGlint = pow(saturate((rawLuma - 0.62) / 0.38), lerp(2.0, 16.0, _Smoothness));
+                fixed3 specColor = fixed3(1.0, 0.99, 0.97) * directGlint * _Smoothness * 0.60;
+                fixed3 envSheen = scene * (0.28 * _Smoothness);
+
+                float alpha = smoothstep(0.12, 0.35, mask) * ((_Strength > 0.01) ? 1.0 : 0.0);
+                if (alpha < 0.005) discard;
+                return fixed4(saturate(diffuse + specColor + envSheen), alpha);
             }
             ENDCG
         }

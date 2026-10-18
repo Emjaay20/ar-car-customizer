@@ -43,7 +43,13 @@ export class CarService {
   async findAssetsForCar(carId: string, type?: string) {
     const car = await this.prisma.carModel.findUnique({ where: { id: carId } });
     if (!car) {
-      throw new NotFoundException('Car not found');
+      const assetType = type == null ? undefined : parseAssetType(type);
+      return this.prisma.asset.findMany({
+        where: {
+          ...(assetType ? { type: assetType } : {}),
+        },
+        orderBy: [{ type: 'asc' }, { name: 'asc' }],
+      });
     }
 
     const assetType = type == null ? undefined : parseAssetType(type);

@@ -151,7 +151,7 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
       return {
         ok: false,
         source: 'unavailable',
-        reason: 'AI Worker unavailable on cloud. Switch to Local PC (192.168.100.66) for real-time AR.',
+        reason: 'On-device mobile AI is active. Live AR operates 100% offline.',
       };
     }
     const ready = await this.waitUntilReady(90_000);

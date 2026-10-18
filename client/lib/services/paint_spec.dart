@@ -2,8 +2,8 @@ import 'dart:convert';
 
 /// Paint message shared with Unity. Unity owns the PBR numbers.
 class PaintSpec {
-  static const finishes = ['gloss', 'matte', 'satin', 'metallic', 'candy'];
-  static const panels = ['body', 'hood', 'roof', 'doors'];
+  static const finishes = ['gloss', 'matte', 'satin', 'metallic', 'candy', 'carbon'];
+  static const panels = ['body', 'hood', 'roof', 'doors', 'mirrors'];
 
   static String normalizeFinish(String? value) {
     final token = (value ?? '').toLowerCase().trim();
@@ -12,6 +12,7 @@ class PaintSpec {
     if (token.contains('satin')) return 'satin';
     if (token.contains('metallic') || token.contains('metal')) return 'metallic';
     if (token.contains('candy')) return 'candy';
+    if (token.contains('carbon')) return 'carbon';
     if (token.contains('gloss')) return 'gloss';
     return 'gloss';
   }
@@ -19,6 +20,7 @@ class PaintSpec {
   static String normalizePanel(String? value) {
     final token = (value ?? '').toLowerCase().trim();
     if (token == 'door' || token == 'doors') return 'doors';
+    if (token == 'mirror' || token == 'mirrors') return 'mirrors';
     if (panels.contains(token)) return token;
     return 'body';
   }

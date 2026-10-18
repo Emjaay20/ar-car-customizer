@@ -26,6 +26,7 @@ public class ShaderBuildKeeper : IPreprocessBuildWithReport
         "ARCar/PhotoPaint",
         "ARCar/PhotoGlass",
         "ARCar/ShowroomFrame",
+        "ARCar/TemporalBlend",
     };
 
     public void OnPreprocessBuild(BuildReport report)

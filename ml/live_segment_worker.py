@@ -604,9 +604,10 @@ def studio_polish_car_paint(
 
     # 1. Bilateral decomposition: separate smooth geometry from sharp creases/panel lines
     smooth_luma = cv2.bilateralFilter(gray, 9, 0.08, 9.0)
-    crease = np.clip(smooth_luma - gray, 0.0, 1.0)
-    # Ambient Occlusion: shutlines and deep creases drop to 0.30 - 0.45, flat metal stays 1.0
-    ao = np.clip(1.0 - 4.5 * crease, 0.30, 1.0)[:, :, None]
+    # Threshold crease so dirty spots and surface scratches do not darken the paint
+    crease = np.clip((smooth_luma - gray - 0.06) * 4.0, 0.0, 1.0)
+    # Ambient Occlusion: shutlines and deep creases drop at most to 0.68, flat metal stays 1.0
+    ao = np.clip(1.0 - 0.32 * crease, 0.68, 1.0)[:, :, None]
 
     # 2. Intrinsic car-normalized illumination (Retinex)
     vals = smooth_luma[car_region]
@@ -746,7 +747,18 @@ def process_frame(
             )[0]
             primary_mask = select_primary_vehicle_mask(result, work_h, work_w)
             if primary_mask is None:
-                return {"ok": False, "reason": "Point camera clearly at a vehicle to lock live paint mask"}
+                # Fallback to vehicle parts model on close-up angles (e.g. hood/bumper/door)
+                parts_mod = get_parts_model()
+                if parts_mod is not None:
+                    p_res = parts_mod.predict(work_bgr, conf=0.10, retina_masks=True, verbose=False)[0]
+                    if p_res.masks is not None and len(p_res.masks.data) > 0:
+                        primary_mask = p_res.masks.data.max(dim=0)[0].cpu().numpy()
+                        if primary_mask.shape != (work_h, work_w):
+                            primary_mask = cv2.resize(primary_mask, (work_w, work_h), interpolation=cv2.INTER_LINEAR)
+                if primary_mask is None:
+                    primary_mask = fallback_center_panel_mask(work_bgr)
+                if primary_mask is None or not np.any(primary_mask > 0.2):
+                    return {"ok": False, "reason": "Point camera clearly at a vehicle to lock live paint mask"}
             source = "yolov8s-seg-hd" if hd_mode else "yolov8s-seg"
         else:
             return {

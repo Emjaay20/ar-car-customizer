@@ -111,37 +111,38 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     }
   ''';
 
+  static final List<Asset> _defaultCatalog = [
+    Asset(id: 'paint-candy-red', name: 'Candy Red', type: 'PAINT', price: 120000, materialBundleUrl: 'paints/candy_red#9B1B30'),
+    Asset(id: 'paint-carmine-red', name: 'Carmine Red', type: 'PAINT', price: 110000, materialBundleUrl: 'paints/carmine_red#8B0000'),
+    Asset(id: 'paint-gloss-black', name: 'Gloss Black', type: 'PAINT', price: 95000, materialBundleUrl: 'paints/gloss_black#111111'),
+    Asset(id: 'paint-matte-black', name: 'Matte Black', type: 'PAINT', price: 105000, materialBundleUrl: 'paints/matte_black#222222'),
+    Asset(id: 'paint-metallic-silver', name: 'Metallic Silver', type: 'PAINT', price: 98000, materialBundleUrl: 'paints/metallic_silver#C0C0C0'),
+    Asset(id: 'paint-modern-steel', name: 'Modern Steel', type: 'PAINT', price: 98000, materialBundleUrl: 'paints/modern_steel#4B4F54'),
+    Asset(id: 'paint-satin-graphite', name: 'Satin Graphite', type: 'PAINT', price: 105000, materialBundleUrl: 'paints/satin_graphite#383E45'),
+    Asset(id: 'paint-alpine-white', name: 'Alpine White', type: 'PAINT', price: 90000, materialBundleUrl: 'paints/alpine_white#F5F5F5'),
+    Asset(id: 'paint-nardo-grey', name: 'Nardo Grey', type: 'PAINT', price: 115000, materialBundleUrl: 'paints/nardo_grey#6C7176'),
+    Asset(id: 'paint-miami-blue', name: 'Miami Blue', type: 'PAINT', price: 130000, materialBundleUrl: 'paints/miami_blue#00A3E0'),
+    Asset(id: 'rim-accord-sport', name: '18-inch Accord Sport', type: 'RIMS', price: 240000, materialBundleUrl: 'rims/accord_sport', anchor: 'wheel'),
+    Asset(id: 'rim-forged-matte', name: '19-inch Forged Matte', type: 'RIMS', price: 320000, materialBundleUrl: 'rims/forged_matte', anchor: 'wheel'),
+    Asset(id: 'spoiler-carbon-lip', name: 'Carbon Lip Spoiler', type: 'SPOILER', price: 85000, materialBundleUrl: 'spoilers/carbon_lip', anchor: 'trunk'),
+  ];
+
   void _post(UnityCommand? command) {
     if (command == null || _unityController == null) return;
     _unityController!.postMessage(command.gameObject, command.method, command.argument);
-  }
-
-  Timer? _autoMaskTimer;
-
-  void _ensureAutoMaskTimer() {
-    _autoMaskTimer ??= Timer.periodic(const Duration(milliseconds: 2400), (_) {
-      if (!mounted) return;
-      if (_sentisLiveActive && !_maskingBusy && !_sharingPhoto) {
-        _refreshLiveMask(silent: true);
-      }
-    });
   }
 
   void _startLiveFilter() {
     if (_unityController == null) return;
     setState(() {
       _sentisLiveActive = true;
-      _unityStatus = '🟢 Live AR Customizer · 60 FPS';
+      _unityStatus = '🟢 On-Device Live AR · 60 FPS';
     });
     _applyCurrentPaint();
     _post(UnityCommands.runSentis(stop: false));
-    _ensureAutoMaskTimer();
-    _refreshLiveMask(silent: false);
   }
 
   Future<void> _pauseLiveFilter() async {
-    _autoMaskTimer?.cancel();
-    _autoMaskTimer = null;
     if (!mounted) return;
     setState(() {
       _sentisLiveActive = false;
@@ -410,8 +411,9 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       return;
     }
 
+    Uint8List? rawBytes;
     try {
-      final rawBytes = await file.readAsBytes();
+      rawBytes = await file.readAsBytes();
       if (!mounted) return;
       final client = GraphQLProvider.of(context).value;
       final result = await client.mutate(
@@ -446,22 +448,26 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
         return;
       }
 
+      // Instant high-res fallback: show captured customized car photo directly in the HD Showroom sheet!
       if (!mounted) return;
       setState(() {
         _sharingPhoto = false;
         _unityStatus = '🟢 Live AR Customizer · 60 FPS';
       });
-      _snack('Studio photo completed.');
+      _showHdShowroomSheet(rawBytes);
     } catch (error) {
       if (!mounted) return;
       setState(() => _sharingPhoto = false);
-      _snack('Could not capture studio photo: $error');
+      if (rawBytes != null) {
+        _showHdShowroomSheet(rawBytes);
+      } else {
+        _snack('Studio snapshot error: $error');
+      }
     }
   }
 
   @override
   void dispose() {
-    _autoMaskTimer?.cancel();
     _hex.dispose();
     super.dispose();
   }
@@ -479,8 +485,6 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       _sendPaint(color: color, finish: finish, panel: _panel);
       if (!_sentisLiveActive) {
         _startLiveFilter();
-      } else if (!_hasActiveMask && !_maskingBusy) {
-        _refreshLiveMask(silent: true);
       }
       return;
     }
@@ -521,8 +525,6 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     _sendPaint(color: color, finish: _finish, panel: _panel);
     if (!_sentisLiveActive) {
       _startLiveFilter();
-    } else if (!_hasActiveMask && !_maskingBusy) {
-      _refreshLiveMask(silent: true);
     }
   }
 
@@ -739,13 +741,19 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       });
       return;
     }
-    if (text.startsWith('SENTIS_NEEDS_MASK') ||
-        text.startsWith('CAMERA_SETTLED') ||
-        text.startsWith('SENTIS_UNAVAILABLE') ||
-        text.startsWith('SENTIS_NO_MODEL')) {
-      if (_sentisLiveActive && !_maskingBusy && !_sharingPhoto) {
-        _refreshLiveMask(silent: true);
+    if (text.startsWith('SENTIS_MASK_UPDATED')) {
+      if (!_hasActiveMask || (_unityStatus?.contains('Locking') ?? false)) {
+        setState(() {
+          _hasActiveMask = true;
+          _unityStatus = '🟢 On-Device Live AR · 60 FPS';
+        });
       }
+      return;
+    }
+    if (text.startsWith('SENTIS_NO_MODEL')) {
+      setState(() {
+        _unityStatus = 'AI Model loading on phone…';
+      });
       return;
     }
     if (text.startsWith('LIVE_TINT:')) {
@@ -830,12 +838,49 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                     },
                   ),
                   ActionChip(
+                    label: const Text('"Gloss Obsidian Black"'),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      setState(() {
+                        _paintColor = '#111111';
+                        _finish = 'gloss';
+                        _panel = 'body';
+                      });
+                      _applyCurrentPaint();
+                    },
+                  ),
+                  ActionChip(
+                    label: const Text('"Wrap Carbon Hood"'),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      setState(() {
+                        _paintColor = '#111111';
+                        _finish = 'carbon';
+                        _panel = 'hood';
+                      });
+                      _applyCurrentPaint();
+                    },
+                  ),
+                  ActionChip(
+                    label: const Text('"Two-Tone Floating Roof"'),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      setState(() {
+                        _paintColor = '#111111';
+                        _finish = 'gloss';
+                        _panel = 'roof';
+                      });
+                      _applyCurrentPaint();
+                    },
+                  ),
+                  ActionChip(
                     label: const Text('"Metallic Silver"'),
                     onPressed: () {
                       Navigator.pop(ctx);
                       setState(() {
                         _paintColor = '#B7B7BE';
                         _finish = 'metallic';
+                        _panel = 'body';
                       });
                       _applyCurrentPaint();
                     },
@@ -881,10 +926,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
               onPressed: () {
                 GraphQLService.setApiUrl('http://192.168.100.66:3000/graphql');
                 Navigator.pop(ctx);
-                setState(() {
-                  _unityStatus = 'Switched to Local PC (192.168.100.66)';
-                });
-                _refreshLiveMask(silent: false);
+                _snack('Switched backend to Local PC (192.168.100.66)');
               },
             ),
             const SizedBox(height: 10),
@@ -898,10 +940,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
               onPressed: () {
                 GraphQLService.setApiUrl('https://ar-car-backend.aetherhost.com.ng/graphql');
                 Navigator.pop(ctx);
-                setState(() {
-                  _unityStatus = 'Switched to Cloud (AetherHost)';
-                });
-                _refreshLiveMask(silent: false);
+                _snack('Switched backend to Cloud (AetherHost)');
               },
             ),
           ],
@@ -1120,17 +1159,16 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                       if (result.isLoading && result.data == null) {
                         return const Center(child: CircularProgressIndicator());
                       }
-                      if (result.hasException) {
-                        return Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Text('Error: ${result.exception}'),
-                        );
+                      List<Asset> assets = [];
+                      if (!result.hasException && result.data?['assetsForCar'] != null) {
+                        assets = ((result.data!['assetsForCar']) as List)
+                            .whereType<Map>()
+                            .map((json) => Asset.fromJson(Map<String, dynamic>.from(json)))
+                            .toList();
                       }
-
-                      final assets = ((result.data?['assetsForCar'] ?? []) as List)
-                          .whereType<Map>()
-                          .map((json) => Asset.fromJson(Map<String, dynamic>.from(json)))
-                          .toList();
+                      if (assets.isEmpty) {
+                        assets = _defaultCatalog;
+                      }
                       _catalogAssets = assets;
                       return ListView(
                         padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),

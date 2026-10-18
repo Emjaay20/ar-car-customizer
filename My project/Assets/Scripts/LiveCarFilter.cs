@@ -16,7 +16,7 @@ public class LiveCarFilter : MonoBehaviour
     bool maskApplied;
     float metallic = 0.08f;
     float smoothness = 0.92f;
-    float strength = 0.95f;
+    float strength = 1.0f;
     float panel;
 
     // Mask viewpoint anchor tracking
@@ -90,23 +90,9 @@ public class LiveCarFilter : MonoBehaviour
         transform.localRotation = Quaternion.identity;
         transform.localScale = new Vector3(width, height, 1f);
 
-        if (material != null && maskApplied && hasMaskPose)
+        if (material != null && maskApplied)
         {
-            float angleDelta = Quaternion.Angle(camera.transform.rotation, maskCamRot);
-            float distDelta = Vector3.Distance(camera.transform.position, maskCamPos);
-            // If the user rotates or pans the camera away from where the mask was captured,
-            // smoothly fade out the mask so it never floats as an unanchored ghost sticker
-            if (angleDelta > 3.5f || distDelta > 0.14f)
-            {
-                float angleFade = Mathf.Clamp01(1.0f - (angleDelta - 3.5f) / 5.5f);
-                float distFade = Mathf.Clamp01(1.0f - (distDelta - 0.14f) / 0.22f);
-                motionFade = Mathf.Min(angleFade, distFade);
-            }
-            else
-            {
-                motionFade = 1.0f;
-            }
-            material.SetFloat("_Strength", (maskApplied && !isLocked) ? (strength * motionFade) : 0f);
+            material.SetFloat("_Strength", (maskApplied && !isLocked) ? strength : 0f);
         }
 
         if (lockedQuad != null && lockedQuad.activeSelf)
@@ -236,7 +222,7 @@ public class LiveCarFilter : MonoBehaviour
         ApplyFinish();
     }
 
-    public bool SetMask(Texture2D mask)
+    public bool SetMask(Texture mask)
     {
         if (!EnsureMaterial()) return false;
         maskApplied = mask != null;

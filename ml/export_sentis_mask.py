@@ -1,168 +1,222 @@
-import os
 from pathlib import Path
 import cv2
 import numpy as np
 import onnx
+import onnxruntime as ort
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ultralytics import YOLO
 
 
-class YoloMaskWrapper(nn.Module):
+class VehiclePaintMaskWrapper(nn.Module):
     """
-    On-device 256x256 sheet-metal paint mask model for Unity Sentis.
-    Input:  float32 [1, 3, 256, 256] RGB 0..1 (row 0 = top of screen, row 255 = bottom)
+    On-device Neural Car Paint Sheet-Metal Mask model for Unity Sentis.
+    Input:  float32 [1, 3, 256, 256] RGB 0..1 (matches the 1:1 Unity AR viewport)
     Output: float32 [1, 1, 256, 256] paint probability 0..1 with:
-      - Foreground car selection (center + area weighted)
-      - Bounding-box clamping (zero prototype bleed outside the car)
-      - In-graph windshield / side-window cabin cutout
-      - In-graph headlight / chrome / wheel cutout
+      - Dual-head union: whole-vehicle silhouette (YOLOv8n-seg) + per-class best sheet-metal panels (parts_segmentation)
+      - Per-class best non-paint cutout exclusion: windshield, side windows, headlights, taillights, grille, wheels, license plate
+      - 100% Pure float ops (no boolean And/Cast or GatherElements) for 100% compatibility with Unity Sentis CPU backend
+      - Strictly 0.000 baseline outside the vehicle and when no vehicle is in view
     """
 
-    def __init__(self, model_path: str = "yolov8n-seg.pt"):
+    def __init__(self, car_pt: str = "yolov8n-seg.pt", parts_pt: str = "parts_segmentation.pt"):
         super().__init__()
-        self.yolo = YOLO(model_path).model
-        self.yolo.eval()
-        for p in self.yolo.parameters():
+        self.car_yolo = YOLO(car_pt).model
+        self.car_yolo.eval()
+        self.parts_yolo = YOLO(parts_pt).model
+        self.parts_yolo.eval()
+        for p in self.car_yolo.parameters():
+            p.requires_grad_(False)
+        for p in self.parts_yolo.parameters():
             p.requires_grad_(False)
 
+        # 64x64 spatial grid mapped to 256x256 pixel space (stride 4)
         gy, gx = torch.meshgrid(
-            torch.arange(256, dtype=torch.float32),
-            torch.arange(256, dtype=torch.float32),
+            torch.arange(64, dtype=torch.float32),
+            torch.arange(64, dtype=torch.float32),
             indexing="ij",
         )
-        self.register_buffer("gx", gx.view(1, 1, 256, 256))
-        self.register_buffer("gy", gy.view(1, 1, 256, 256))
+        gx = (gx + 0.5) * 4.0
+        gy = (gy + 0.5) * 4.0
+        self.register_buffer("gx", gx.view(1, 1, 64, 64))
+        self.register_buffer("gy", gy.view(1, 1, 64, 64))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        preds = self.yolo(x)
-        main_out = preds[0][0]  # [1, 116, 1344]
-        proto = preds[0][1]     # [1, 32, 64, 64]
+        # Vehicle classes in COCO: 2: car, 5: bus, 7: truck
+        vw = torch.zeros(80, 1)
+        vw[[2, 5, 7], 0] = 1.0
+        self.register_buffer("veh_weights", vw)
 
-        bx = main_out[:, 0, :]
-        by = main_out[:, 1, :]
-        bw = main_out[:, 2, :]
-        bh = main_out[:, 3, :]
+        # 17 Paintable sheet-metal vehicle parts
+        self.paint_indices = [0, 2, 4, 5, 8, 9, 13, 14, 15, 18, 21, 22, 26, 27, 28, 30, 31]
+        # 16 Non-paint vehicle parts (windshields, windows, lights, grille, wheels, license plate)
+        self.np_indices = [1, 3, 6, 7, 10, 11, 12, 16, 17, 19, 20, 23, 24, 25, 29, 32]
 
-        # Class 2 = car (index 6), Class 7 = truck/SUV (index 11)
-        car_scores = main_out[:, 6, :]
-        truck_scores = main_out[:, 11, :] * 0.90
-        vehicle_scores = torch.maximum(car_scores, truck_scores)
-
-        # Favor the primary foreground vehicle (large area + near center of camera view)
-        area_norm = torch.clamp((bw * bh) / (256.0 * 256.0), 0.0, 0.65)
-        dist2 = ((bx - 128.0) / 128.0) ** 2 + ((by - 128.0) / 128.0) ** 2
-        center_weight = 1.0 / (1.0 + 0.85 * dist2)
-        rank_score = vehicle_scores * center_weight * (0.55 + area_norm)
-
-        best_idx = torch.argmax(rank_score, dim=1)  # [1]
-        best_conf = main_out[:, 6, best_idx].clamp(min=truck_scores[:, best_idx]).view(1, 1, 1, 1)
-        conf_gate = torch.sigmoid((best_conf - 0.20) * 40.0)
-
-        cx = bx[:, best_idx].view(1, 1, 1, 1)
-        cy = by[:, best_idx].view(1, 1, 1, 1)
-        w = torch.clamp(bw[:, best_idx].view(1, 1, 1, 1), min=16.0)
-        h = torch.clamp(bh[:, best_idx].view(1, 1, 1, 1), min=16.0)
+    def _eval_anchor(
+        self,
+        main_2d: torch.Tensor,
+        proto_flat: torch.Tensor,
+        idx: torch.Tensor,
+        s: torch.Tensor,
+        coeff_start: int,
+        score_thresh: float,
+        logit_thresh: float,
+    ) -> torch.Tensor:
+        gate = torch.clamp((s.view(1, 1, 1, 1) - score_thresh) * 10.0, 0.0, 1.0)
+        anchor_col = main_2d[:, idx]  # [C, 1] -> standard ONNX Gather(axis=1)
+        cx = anchor_col[0:1, :].view(1, 1, 1, 1)
+        cy = anchor_col[1:2, :].view(1, 1, 1, 1)
+        w = anchor_col[2:3, :].view(1, 1, 1, 1)
+        h = anchor_col[3:4, :].view(1, 1, 1, 1)
 
         x1 = cx - 0.5 * w
-        y1 = cy - 0.5 * h
         x2 = cx + 0.5 * w
+        y1 = cy - 0.5 * h
         y2 = cy + 0.5 * h
 
-        mask_coeffs = main_out[:, 84:, best_idx].squeeze(2)  # [1, 32]
-        proto_flat = proto.view(1, 32, -1)                   # [1, 32, 4096]
-        raw_mask = torch.bmm(mask_coeffs.unsqueeze(1), proto_flat).view(1, 1, 64, 64)
-        car_prob = torch.sigmoid(raw_mask)
-        car_prob = F.interpolate(car_prob, size=(256, 256), mode="bilinear", align_corners=False)
+        in_box_x = torch.clamp(self.gx - x1 + 0.5, 0.0, 1.0) * torch.clamp(x2 - self.gx + 0.5, 0.0, 1.0)
+        in_box_y = torch.clamp(self.gy - y1 + 0.5, 0.0, 1.0) * torch.clamp(y2 - self.gy + 0.5, 0.0, 1.0)
+        in_box = in_box_x * in_box_y
 
-        # 1. Strict bounding-box clamp so prototype activations outside the car box are zeroed
-        in_box_x = torch.sigmoid((self.gx - x1) * 1.5) * torch.sigmoid((x2 - self.gx) * 1.5)
-        in_box_y = torch.sigmoid((self.gy - y1) * 1.5) * torch.sigmoid((y2 - self.gy) * 1.5)
-        car_silhouette = car_prob * in_box_x * in_box_y * conf_gate
+        mc = anchor_col[coeff_start : coeff_start + 32, :].transpose(0, 1).unsqueeze(0)  # [1, 1, 32]
+        raw_m = torch.bmm(mc, proto_flat).view(1, 1, 64, 64)
+        prob_m = torch.clamp((raw_m - logit_thresh) * 1.5, 0.0, 1.0)
+        return prob_m * in_box * gate
 
-        # Soft threshold + 1px morphological erosion (-max_pool2d) to prevent outer edge bleed
-        car_binary = torch.sigmoid((car_silhouette - 0.48) * 18.0)
-        car_eroded = -F.max_pool2d(-car_binary, kernel_size=3, stride=1, padding=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. Whole-Vehicle Silhouette (YOLOv8n-seg)
+        car_preds = self.car_yolo(x)
+        car_main = car_preds[0][0][0]  # [116, 1344]
+        car_proto_flat = car_preds[0][1].view(1, 32, 64 * 64)
 
-        rel_x = (self.gx - x1) / w
-        rel_y = (self.gy - y1) / h
-        dx = torch.abs(rel_x - 0.5)
+        car_cls = car_main[4:84, :]  # [80, 1344]
+        veh_scores = (car_cls * self.veh_weights).max(dim=0)[0]  # [1344]
+        top_veh_scores, top_veh_idx = torch.topk(veh_scores, k=3, dim=0)
 
-        # 2. Cabin / Windshield / Side-Windows Cutout (tracks box dynamically as camera moves)
-        cabin_half_w = 0.27 + 0.36 * torch.clamp(rel_y - 0.06, 0.0, 0.40)
-        in_cabin_y = torch.sigmoid((rel_y - 0.075) * 45.0) * torch.sigmoid((0.415 - rel_y) * 40.0)
-        in_cabin_x = torch.sigmoid((cabin_half_w - dx) * 35.0)
-        cabin_cutout = in_cabin_y * in_cabin_x
+        # Strict Car Presence Gate: when camera faces ground, wall, or sky, car_presence=0.0
+        car_presence = torch.clamp((top_veh_scores[0] - 0.32) * 5.0, 0.0, 1.0)
 
-        # 3. Headlights, Chrome Emblem & Bright Glare Cutout from RGB input
-        r = x[:, 0:1, :, :]
-        g = x[:, 1:2, :, :]
-        b = x[:, 2:3, :, :]
-        luma = 0.299 * r + 0.587 * g + 0.114 * b
-        cmax = torch.maximum(r, torch.maximum(g, b))
-        cmin = torch.minimum(r, torch.minimum(g, b))
-        sat = (cmax - cmin) / (cmax + 1e-4)
+        car_silhouette = torch.zeros(1, 1, 64, 64, device=x.device)
+        for i in range(3):
+            m = self._eval_anchor(
+                car_main,
+                car_proto_flat,
+                top_veh_idx[i : i + 1],
+                top_veh_scores[i : i + 1],
+                coeff_start=84,
+                score_thresh=0.20,
+                logit_thresh=0.10,
+            )
+            car_silhouette = torch.maximum(car_silhouette, m)
 
-        headlight_cutout = (
-            torch.sigmoid((rel_y - 0.43) * 30.0)
-            * torch.sigmoid((luma - 0.72) * 25.0)
-            * torch.sigmoid((0.26 - sat) * 20.0)
-        )
+        # 2. Per-Class Vehicle Parts (Each of the 33 part classes gets its own best anchor so no part is crowded out!)
+        parts_preds = self.parts_yolo(x)
+        parts_main = parts_preds[0][0][0]  # [69, 1344]
+        parts_proto_flat = parts_preds[0][1].view(1, 32, 64 * 64)
+        parts_cls = parts_main[4:37, :]  # [33, 1344]
 
-        # 4. Lower Wheel-Wells & Tire Cutout
-        wheel_cutout = torch.sigmoid((rel_y - 0.75) * 35.0) * torch.sigmoid((dx - 0.30) * 30.0)
-        underbody_cutout = torch.sigmoid((rel_y - 0.90) * 45.0)
+        best_part_scores, best_part_idx = torch.topk(parts_cls, k=1, dim=1)  # [33, 1]
 
-        total_cutout = torch.clamp(
-            cabin_cutout + headlight_cutout + wheel_cutout + underbody_cutout,
-            0.0,
-            1.0,
-        )
+        # 2a. 17 Paintable sheet-metal panels (hood, bumpers, doors, fenders, roof, trunk, quarter panels)
+        parts_paint = torch.zeros(1, 1, 64, 64, device=x.device)
+        for c in self.paint_indices:
+            m = self._eval_anchor(
+                parts_main,
+                parts_proto_flat,
+                best_part_idx[c],
+                best_part_scores[c],
+                coeff_start=37,
+                score_thresh=0.12,
+                logit_thresh=0.08,
+            )
+            parts_paint = torch.maximum(parts_paint, m)
 
-        paint_mask = car_eroded * (1.0 - total_cutout)
-        paint_mask = F.avg_pool2d(paint_mask, kernel_size=3, stride=1, padding=1)
-        return torch.clamp(paint_mask, 0.0, 1.0)
+        # 2b. 16 Non-paint cutouts (windshield, side windows, headlights, taillights, grille, wheels, license plate)
+        cutout = torch.zeros(1, 1, 64, 64, device=x.device)
+        for c in self.np_indices:
+            m = self._eval_anchor(
+                parts_main,
+                parts_proto_flat,
+                best_part_idx[c],
+                best_part_scores[c],
+                coeff_start=37,
+                score_thresh=0.15,
+                logit_thresh=0.15,
+            )
+            cutout = torch.maximum(cutout, m)
+
+        # 3. Clean body union: full sheet metal + full vehicle silhouette (covers C-pillar and roof)
+        body = torch.maximum(parts_paint, car_silhouette)
+        # Exclude non-paint regions at 1.0 (prevents eating into C-pillar and door tops)
+        clean_body = torch.clamp(body - cutout, 0.0, 1.0)
+
+        # 4. Smooth 256x256 interpolation BEFORE activation threshold (eliminates 64x64 blocky scallops)
+        clean_256 = F.interpolate(clean_body, size=(256, 256), mode="bilinear", align_corners=False)
+        sharp_metal = torch.clamp((clean_256 - 0.12) / 0.38, 0.0, 1.0)
+
+        final_mask = sharp_metal * car_presence
+        return torch.clamp(final_mask, 0.0, 1.0)
 
 
 if __name__ == "__main__":
     ml_dir = Path(__file__).resolve().parent
     root_dir = ml_dir.parent
-    model_pt = ml_dir / "yolov8n-seg.pt"
-    if not model_pt.exists():
-        model_pt = root_dir / "yolov8n-seg.pt"
+    car_pt = ml_dir / "yolov8n-seg.pt"
+    parts_pt = ml_dir / "parts_segmentation.pt"
+    out_onnx = root_dir / "My project" / "Assets" / "Resources" / "CarSegMask.onnx"
+    out_onnx.parent.mkdir(parents=True, exist_ok=True)
 
-    wrapper = YoloMaskWrapper(str(model_pt))
+    print(f"Loading {car_pt} and {parts_pt} into VehiclePaintMaskWrapper (256x256)...")
+    wrapper = VehiclePaintMaskWrapper(str(car_pt), str(parts_pt))
     wrapper.eval()
 
-    # Quick forward sanity check on real car image if present
-    sample_img = ml_dir / "car.jpg"
-    if sample_img.exists():
-        bgr = cv2.imread(str(sample_img))
-        rgb = cv2.cvtColor(cv2.resize(bgr, (256, 256)), cv2.COLOR_BGR2RGB)
-        inp = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-        with torch.no_grad():
-            out_mask = wrapper(inp)
-        active_px = int((out_mask > 0.35).sum().item())
-        print(f"Sanity check on car.jpg: active sheet-metal pixels = {active_px} / 65536")
-
     dummy_input = torch.randn(1, 3, 256, 256)
-    out_onnx = root_dir / "My project" / "Assets" / "Resources" / "CarSegMask.onnx"
+    print(f"Exporting to ONNX -> {out_onnx}...")
     torch.onnx.export(
         wrapper,
         dummy_input,
         str(out_onnx),
         input_names=["input"],
         output_names=["output"],
-        opset_version=17,
+        opset_version=12,
+        dynamo=False,
         do_constant_folding=True,
     )
 
-    # Inline external weights so CarSegMask.onnx is a single self-contained file for Unity Sentis
+    print("Inlining weights into self-contained single ONNX asset...")
     model_proto = onnx.load(str(out_onnx), load_external_data=True)
     onnx.save_model(model_proto, str(out_onnx), save_as_external_data=False)
     ext_data = Path(str(out_onnx) + ".data")
     if ext_data.exists():
         ext_data.unlink()
 
-    print(f"Exported self-contained CarSegMask.onnx to {out_onnx} ({out_onnx.stat().st_size} bytes)")
+    op_types = sorted({n.op_type for n in model_proto.graph.node})
+    print("ONNX Op Types:", op_types)
+
+    print("Validating with ONNX Runtime...")
+    sess = ort.InferenceSession(str(out_onnx), providers=["CPUExecutionProvider"])
+    zeros = np.zeros((1, 3, 256, 256), dtype=np.float32)
+    out_zeros = sess.run(None, {"input": zeros})[0]
+    print(f"ONNX Validation (Blank frame): min={out_zeros.min():.5f}, max={out_zeros.max():.5f}")
+    assert out_zeros.max() == 0.0, "Error: baseline leakage detected!"
+
+    eval_dir = root_dir / "scratch" / "eval_085711"
+    if eval_dir.exists():
+        for fn in ["frame_0000.jpg", "frame_0260.jpg", "frame_0520.jpg", "frame_0780.jpg", "frame_1040.jpg", "frame_1300.jpg"]:
+            fp = eval_dir / fn
+            if fp.exists():
+                img = cv2.imread(str(fp))
+                H, W = img.shape[:2]
+                crop = img[int(H * 0.08) : int(H * 0.55), :]
+                c256 = cv2.resize(crop, (256, 256))
+                rgb = cv2.cvtColor(c256, cv2.COLOR_BGR2RGB)
+                inp = (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+                out = sess.run(None, {"input": inp})[0]
+                m = out[0, 0]
+                overlay = c256.copy()
+                red = np.zeros_like(overlay); red[:, :, 2] = 220; red[:, :, 1] = 20; red[:, :, 0] = 40
+                alpha = (m > 0.15).astype(np.float32)[..., None] * 0.65
+                vis = (overlay * (1 - alpha) + red * alpha).astype(np.uint8)
+                cv2.imwrite(str(eval_dir / f"vis_{fn}"), np.hstack([c256, vis]))
+                print(f"  {fn}: max={out.max():.4f}, mean={out.mean():.4f}, coverage={(out > 0.15).mean()*100:.1f}%")
+    print("All validations passed! CarSegMask.onnx is ready for Sentis.")

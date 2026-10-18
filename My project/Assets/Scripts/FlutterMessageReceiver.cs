@@ -377,9 +377,9 @@ public class FlutterMessageReceiver : MonoBehaviour
         return true;
     }
 
-    Texture2D lastMaskTexture;
+    Texture lastMaskTexture;
 
-    bool ApplyMaskTexture(Texture2D texture)
+    bool ApplyMaskTexture(Texture texture)
     {
         var camera = Camera.main;
         var filter = LiveCarFilter.Ensure(camera);
@@ -599,7 +599,16 @@ public class FlutterMessageReceiver : MonoBehaviour
             yield break;
         }
 
-        var bytes = texture.EncodeToPNG();
+        // Crop snapshot to Unity AR camera viewport (top ~55% of portrait screen, excluding bottom Flutter drawer)
+        int cropY = (int)(texture.height * 0.44f);
+        int cropH = texture.height - cropY;
+        int cropW = texture.width;
+        var croppedTex = new Texture2D(cropW, cropH, TextureFormat.RGB24, false);
+        var pixels = texture.GetPixels(0, cropY, cropW, cropH);
+        croppedTex.SetPixels(pixels);
+        croppedTex.Apply();
+        var bytes = croppedTex.EncodeToPNG();
+        Destroy(croppedTex);
         Destroy(texture);
 
         var path = Path.Combine(

@@ -41,6 +41,7 @@ __pycache__/
 *.pt
 CarSegMask.onnx.data
 yolov8n-seg.onnx
+parts_segmentation.onnx
 scratch/
 *.log
 My
