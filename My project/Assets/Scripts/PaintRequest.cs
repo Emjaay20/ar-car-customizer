@@ -87,6 +87,19 @@ public class PaintRequest
         }
     }
 
+    public float FinishId()
+    {
+        switch (NormalizeFinish(finish))
+        {
+            case "matte": return 1f;
+            case "satin": return 2f;
+            case "metallic": return 3f;
+            case "candy": return 4f;
+            case "carbon": return 5f;
+            default: return 0f; // gloss
+        }
+    }
+
     public float PanelId()
     {
         switch (NormalizePanel(panel))

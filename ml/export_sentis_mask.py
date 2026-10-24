@@ -31,16 +31,16 @@ class VehiclePaintMaskWrapper(nn.Module):
         for p in self.parts_yolo.parameters():
             p.requires_grad_(False)
 
-        # 64x64 spatial grid mapped to 256x256 pixel space (stride 4)
+        # 96x96 spatial grid mapped to 384x384 pixel space (stride 4)
         gy, gx = torch.meshgrid(
-            torch.arange(64, dtype=torch.float32),
-            torch.arange(64, dtype=torch.float32),
+            torch.arange(96, dtype=torch.float32),
+            torch.arange(96, dtype=torch.float32),
             indexing="ij",
         )
         gx = (gx + 0.5) * 4.0
         gy = (gy + 0.5) * 4.0
-        self.register_buffer("gx", gx.view(1, 1, 64, 64))
-        self.register_buffer("gy", gy.view(1, 1, 64, 64))
+        self.register_buffer("gx", gx.view(1, 1, 96, 96))
+        self.register_buffer("gy", gy.view(1, 1, 96, 96))
 
         # Vehicle classes in COCO: 2: car, 5: bus, 7: truck
         vw = torch.zeros(80, 1)
@@ -79,24 +79,24 @@ class VehiclePaintMaskWrapper(nn.Module):
         in_box = in_box_x * in_box_y
 
         mc = anchor_col[coeff_start : coeff_start + 32, :].transpose(0, 1).unsqueeze(0)  # [1, 1, 32]
-        raw_m = torch.bmm(mc, proto_flat).view(1, 1, 64, 64)
+        raw_m = torch.bmm(mc, proto_flat).view(1, 1, 96, 96)
         prob_m = torch.clamp((raw_m - logit_thresh) * 1.5, 0.0, 1.0)
         return prob_m * in_box * gate
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1. Whole-Vehicle Silhouette (YOLOv8n-seg)
         car_preds = self.car_yolo(x)
-        car_main = car_preds[0][0][0]  # [116, 1344]
-        car_proto_flat = car_preds[0][1].view(1, 32, 64 * 64)
+        car_main = car_preds[0][0][0]  # [116, 3024]
+        car_proto_flat = car_preds[0][1].view(1, 32, 96 * 96)
 
-        car_cls = car_main[4:84, :]  # [80, 1344]
-        veh_scores = (car_cls * self.veh_weights).max(dim=0)[0]  # [1344]
+        car_cls = car_main[4:84, :]  # [80, 3024]
+        veh_scores = (car_cls * self.veh_weights).max(dim=0)[0]  # [3024]
         top_veh_scores, top_veh_idx = torch.topk(veh_scores, k=3, dim=0)
 
         # Strict Car Presence Gate: when camera faces ground, wall, or sky, car_presence=0.0
         car_presence = torch.clamp((top_veh_scores[0] - 0.32) * 5.0, 0.0, 1.0)
 
-        car_silhouette = torch.zeros(1, 1, 64, 64, device=x.device)
+        car_silhouette = torch.zeros(1, 1, 96, 96, device=x.device)
         for i in range(3):
             m = self._eval_anchor(
                 car_main,
@@ -111,14 +111,14 @@ class VehiclePaintMaskWrapper(nn.Module):
 
         # 2. Per-Class Vehicle Parts (Each of the 33 part classes gets its own best anchor so no part is crowded out!)
         parts_preds = self.parts_yolo(x)
-        parts_main = parts_preds[0][0][0]  # [69, 1344]
-        parts_proto_flat = parts_preds[0][1].view(1, 32, 64 * 64)
-        parts_cls = parts_main[4:37, :]  # [33, 1344]
+        parts_main = parts_preds[0][0][0]  # [69, 3024]
+        parts_proto_flat = parts_preds[0][1].view(1, 32, 96 * 96)
+        parts_cls = parts_main[4:37, :]  # [33, 3024]
 
         best_part_scores, best_part_idx = torch.topk(parts_cls, k=1, dim=1)  # [33, 1]
 
         # 2a. 17 Paintable sheet-metal panels (hood, bumpers, doors, fenders, roof, trunk, quarter panels)
-        parts_paint = torch.zeros(1, 1, 64, 64, device=x.device)
+        parts_paint = torch.zeros(1, 1, 96, 96, device=x.device)
         for c in self.paint_indices:
             m = self._eval_anchor(
                 parts_main,
@@ -132,7 +132,7 @@ class VehiclePaintMaskWrapper(nn.Module):
             parts_paint = torch.maximum(parts_paint, m)
 
         # 2b. 16 Non-paint cutouts (windshield, side windows, headlights, taillights, grille, wheels, license plate)
-        cutout = torch.zeros(1, 1, 64, 64, device=x.device)
+        cutout = torch.zeros(1, 1, 96, 96, device=x.device)
         for c in self.np_indices:
             m = self._eval_anchor(
                 parts_main,
@@ -150,9 +150,9 @@ class VehiclePaintMaskWrapper(nn.Module):
         # Exclude non-paint regions at 1.0 (prevents eating into C-pillar and door tops)
         clean_body = torch.clamp(body - cutout, 0.0, 1.0)
 
-        # 4. Smooth 256x256 interpolation BEFORE activation threshold (eliminates 64x64 blocky scallops)
-        clean_256 = F.interpolate(clean_body, size=(256, 256), mode="bilinear", align_corners=False)
-        sharp_metal = torch.clamp((clean_256 - 0.12) / 0.38, 0.0, 1.0)
+        # 4. Smooth 384x384 interpolation BEFORE activation threshold (tightened to prevent spill beyond roof/sills)
+        clean_384 = F.interpolate(clean_body, size=(384, 384), mode="bilinear", align_corners=False)
+        sharp_metal = torch.clamp((clean_384 - 0.24) / 0.35, 0.0, 1.0)
 
         final_mask = sharp_metal * car_presence
         return torch.clamp(final_mask, 0.0, 1.0)
@@ -166,11 +166,11 @@ if __name__ == "__main__":
     out_onnx = root_dir / "My project" / "Assets" / "Resources" / "CarSegMask.onnx"
     out_onnx.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading {car_pt} and {parts_pt} into VehiclePaintMaskWrapper (256x256)...")
+    print(f"Loading {car_pt} and {parts_pt} into VehiclePaintMaskWrapper (384x384)...")
     wrapper = VehiclePaintMaskWrapper(str(car_pt), str(parts_pt))
     wrapper.eval()
 
-    dummy_input = torch.randn(1, 3, 256, 256)
+    dummy_input = torch.randn(1, 3, 384, 384)
     print(f"Exporting to ONNX -> {out_onnx}...")
     torch.onnx.export(
         wrapper,
@@ -195,7 +195,7 @@ if __name__ == "__main__":
 
     print("Validating with ONNX Runtime...")
     sess = ort.InferenceSession(str(out_onnx), providers=["CPUExecutionProvider"])
-    zeros = np.zeros((1, 3, 256, 256), dtype=np.float32)
+    zeros = np.zeros((1, 3, 384, 384), dtype=np.float32)
     out_zeros = sess.run(None, {"input": zeros})[0]
     print(f"ONNX Validation (Blank frame): min={out_zeros.min():.5f}, max={out_zeros.max():.5f}")
     assert out_zeros.max() == 0.0, "Error: baseline leakage detected!"
@@ -208,15 +208,15 @@ if __name__ == "__main__":
                 img = cv2.imread(str(fp))
                 H, W = img.shape[:2]
                 crop = img[int(H * 0.08) : int(H * 0.55), :]
-                c256 = cv2.resize(crop, (256, 256))
-                rgb = cv2.cvtColor(c256, cv2.COLOR_BGR2RGB)
+                c384 = cv2.resize(crop, (384, 384))
+                rgb = cv2.cvtColor(c384, cv2.COLOR_BGR2RGB)
                 inp = (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
                 out = sess.run(None, {"input": inp})[0]
                 m = out[0, 0]
-                overlay = c256.copy()
+                overlay = c384.copy()
                 red = np.zeros_like(overlay); red[:, :, 2] = 220; red[:, :, 1] = 20; red[:, :, 0] = 40
                 alpha = (m > 0.15).astype(np.float32)[..., None] * 0.65
                 vis = (overlay * (1 - alpha) + red * alpha).astype(np.uint8)
-                cv2.imwrite(str(eval_dir / f"vis_{fn}"), np.hstack([c256, vis]))
+                cv2.imwrite(str(eval_dir / f"vis_{fn}"), np.hstack([c384, vis]))
                 print(f"  {fn}: max={out.max():.4f}, mean={out.mean():.4f}, coverage={(out > 0.15).mean()*100:.1f}%")
     print("All validations passed! CarSegMask.onnx is ready for Sentis.")

@@ -190,6 +190,7 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
       repolishOnly?: boolean;
       frameId?: string;
       hdMode?: boolean;
+      fullCoverage?: boolean;
     },
   ): Promise<LiveSegmentationModel> {
     const repolishOnly = Boolean(options?.repolishOnly);
@@ -218,6 +219,7 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
       repolishOnly,
       frameId: options?.frameId,
       hdMode: Boolean(options?.hdMode),
+      fullCoverage: Boolean(options?.fullCoverage),
     });
     const elapsedMs = Date.now() - t0;
 
@@ -350,7 +352,35 @@ export class VisionService implements OnModuleInit, OnModuleDestroy {
       assets,
     };
   }
+
+  async generateShowroomReel(input: {
+    imagesBase64: string[];
+    labels: string[];
+    paintName?: string;
+    hexColor?: string;
+    finish?: string;
+    vehicleTitle?: string;
+  }): Promise<{ ok: boolean; videoBase64?: string; reason?: string }> {
+    const res = await this.sendWorkerCommand(
+      {
+        mode: 'generate_reel',
+        imagesBase64: input.imagesBase64,
+        labels: input.labels,
+        paintName: input.paintName,
+        hexColor: input.hexColor,
+        finish: input.finish,
+        vehicleTitle: input.vehicleTitle,
+      },
+      75_000,
+    );
+    return {
+      ok: res.ok === true,
+      videoBase64: typeof res.videoBase64 === 'string' ? res.videoBase64 : undefined,
+      reason: typeof res.reason === 'string' ? res.reason : undefined,
+    };
+  }
 }
+
 
 function emptyResult(source: string, reason: string): VehicleIdentificationModel {
   return {

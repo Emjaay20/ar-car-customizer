@@ -18,6 +18,7 @@ public class LiveCarFilter : MonoBehaviour
     float smoothness = 0.92f;
     float strength = 1.0f;
     float panel;
+    float finishMode = 0f;
 
     // Mask viewpoint anchor tracking
     Vector3 maskCamPos;
@@ -93,6 +94,27 @@ public class LiveCarFilter : MonoBehaviour
         if (material != null && maskApplied)
         {
             material.SetFloat("_Strength", (maskApplied && !isLocked) ? strength : 0f);
+
+            // 6DoF Camera Reprojection: keeps the neural mask locked to vehicle sheet metal
+            // between inference frames as the phone pans or rotates (Snapchat-style tracking)
+            if (hasMaskPose)
+            {
+                Quaternion deltaRot = Quaternion.Inverse(camera.transform.rotation) * maskCamRot;
+                Vector3 euler = deltaRot.eulerAngles;
+                float yawRad = Mathf.DeltaAngle(0f, euler.y) * Mathf.Deg2Rad;
+                float pitchRad = Mathf.DeltaAngle(0f, euler.x) * Mathf.Deg2Rad;
+                Vector3 localDeltaPos = camera.transform.InverseTransformPoint(maskCamPos);
+
+                float tanHalfFovY = Mathf.Max(0.001f, Mathf.Tan(camera.fieldOfView * 0.5f * Mathf.Deg2Rad));
+                float tanHalfFovX = tanHalfFovY * camera.aspect;
+
+                float uvShiftX = (Mathf.Tan(yawRad) + (localDeltaPos.x / 2.8f)) / (2f * tanHalfFovX);
+                float uvShiftY = (-Mathf.Tan(pitchRad) + (localDeltaPos.y / 2.8f)) / (2f * tanHalfFovY);
+
+                uvShiftX = Mathf.Clamp(uvShiftX, -0.35f, 0.35f);
+                uvShiftY = Mathf.Clamp(uvShiftY, -0.35f, 0.35f);
+                material.SetVector("_MaskUVOffset", new Vector4(uvShiftX, uvShiftY, 0f, 0f));
+            }
         }
 
         if (lockedQuad != null && lockedQuad.activeSelf)
@@ -213,34 +235,62 @@ public class LiveCarFilter : MonoBehaviour
         return true;
     }
 
-    public void SetFinish(float metallic, float smoothness, float strength, float panel)
+    public void SetFinish(float metallic, float smoothness, float strength, float panel, float finishMode = 0f)
     {
         this.metallic = metallic;
         this.smoothness = smoothness;
         this.strength = strength;
         this.panel = panel;
+        this.finishMode = finishMode;
         ApplyFinish();
     }
 
-    public bool SetMask(Texture mask)
+    public bool SetMask(Texture mask, float letterboxAspect = 1.0f, Vector3 capturePos = default, Quaternion captureRot = default)
     {
-        if (!EnsureMaterial()) return false;
-        maskApplied = mask != null;
-        material.SetTexture("_MaskTex", mask != null ? mask : Texture2D.blackTexture);
-        var camera = GetComponentInParent<Camera>();
-        if (camera != null && mask != null)
+        if (mask == null)
         {
-            maskCamPos = camera.transform.position;
-            maskCamRot = camera.transform.rotation;
+            ClearLive();
+            return false;
+        }
+
+        if (!EnsureMaterial()) return false;
+        maskApplied = true;
+        material.SetTexture("_MaskTex", mask);
+        material.SetFloat("_LetterboxAspect", letterboxAspect);
+
+        var mr = GetComponent<MeshRenderer>();
+        if (mr != null) mr.enabled = true;
+
+        var camera = GetComponentInParent<Camera>();
+        if (camera != null)
+        {
+            maskCamPos = (capturePos != default) ? capturePos : camera.transform.position;
+            maskCamRot = (captureRot != default) ? captureRot : camera.transform.rotation;
             hasMaskPose = true;
             motionFade = 1.0f;
         }
-        else if (mask == null)
-        {
-            hasMaskPose = false;
-        }
+
         ApplyFinish();
-        return mask != null;
+        return maskApplied;
+    }
+
+    public void ClearLive()
+    {
+        maskApplied = false;
+        hasMaskPose = false;
+        if (material != null)
+        {
+            material.SetTexture("_MaskTex", Texture2D.blackTexture);
+            material.SetTexture("_SceneTex", Texture2D.blackTexture);
+            material.SetFloat("_Strength", 0f);
+            material.SetVector("_MaskUVOffset", Vector4.zero);
+        }
+        var mr = GetComponent<MeshRenderer>();
+        if (mr != null) mr.enabled = false;
+
+        ReleaseLockedFrame();
+        if (lockedQuad != null) lockedQuad.SetActive(false);
+        isLocked = false;
     }
 
     public void SetSceneTexture(Texture sceneTex)
@@ -256,7 +306,8 @@ public class LiveCarFilter : MonoBehaviour
         material.SetFloat("_Metallic", metallic);
         material.SetFloat("_Smoothness", smoothness);
         material.SetFloat("_Panel", panel);
-        // Live shader OFF while showroom full frame is locked
+        material.SetFloat("_Finish", finishMode);
+        // Live shader OFF while showroom full frame is locked or when paused
         material.SetFloat("_Strength", (maskApplied && !isLocked) ? strength : 0f);
     }
 

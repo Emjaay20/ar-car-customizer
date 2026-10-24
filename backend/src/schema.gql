@@ -66,6 +66,12 @@ type LiveSegmentationModel {
   frameId: String
 }
 
+type ShowroomReelModel {
+  ok: Boolean!
+  videoBase64: String
+  reason: String
+}
+
 type VehicleIdentificationModel {
   identified: Boolean!
   source: String!
@@ -172,6 +178,7 @@ type Mutation {
   shareConfiguration(id: ID!): UserConfigurationModel!
   identifyVehicle(input: IdentifyVehicleInput!): VehicleIdentificationModel!
   segmentLiveCar(input: IdentifyVehicleInput!): LiveSegmentationModel!
+  generateShowroomReel(input: GenerateShowroomReelInput!): ShowroomReelModel!
   startInspection(input: CreateInspectionInput!): InspectionModel!
   recordDamageAssessment(input: RecordDamageAssessmentInput!): InspectionModel!
   createJobCard(input: CreateJobCardInput!): JobCardModel!
@@ -205,6 +212,16 @@ input IdentifyVehicleInput {
   repolishOnly: Boolean
   frameId: String
   hdMode: Boolean
+  fullCoverage: Boolean
+}
+
+input GenerateShowroomReelInput {
+  imagesBase64: [String!]!
+  labels: [String!]!
+  paintName: String
+  hexColor: String
+  finish: String
+  vehicleTitle: String
 }
 
 input CreateInspectionInput {

@@ -9,6 +9,9 @@ Shader "ARCar/LivePaint"
         _Metallic ("Metallic", Range(0, 1)) = 0.08
         _Smoothness ("Smoothness", Range(0, 1)) = 0.92
         _Panel ("Panel", Float) = 0
+        _Finish ("Finish Mode", Float) = 0
+        _MaskUVOffset ("Mask UV Offset", Vector) = (0, 0, 0, 0)
+        _LetterboxAspect ("Letterbox Aspect", Float) = 1.0
     }
 
     SubShader
@@ -50,6 +53,9 @@ Shader "ARCar/LivePaint"
                 float _Metallic;
                 float _Smoothness;
                 float _Panel;
+                float _Finish;
+                float4 _MaskUVOffset;
+                float _LetterboxAspect;
             CBUFFER_END
 
             struct Attributes
@@ -110,84 +116,153 @@ Shader "ARCar/LivePaint"
                 return acc / 25.0;
             }
 
-            half3 ShadePaint(float3 maskSample, float3 scene, float2 uv)
+            // Meta AI RGB <-> HSV conversion with Value preservation (keeps shadows/reflections, stops see-through pink)
+            float3 rgb2hsv(float3 c)
             {
-                float mask = maskSample.r;
+                float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+                float4 p = lerp(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
+                float4 q = lerp(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
+                float d = q.x - min(q.w, q.y);
+                float e = 1.0e-10;
+                return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+            }
 
-                // 1. Scene luminance and lighting gradient
-                float rawLuma = dot(scene, float3(0.299, 0.587, 0.114));
-                
-                // Top-to-bottom macro 3D lighting gradient (sky illumination -> ground)
-                float macroLight = lerp(0.88, 1.08, saturate(1.0 - uv.y * 0.75));
-                
-                // Gentle macro scene lighting modulation (smooth ambient adaptation, +/- 12%)
-                // Clamped so dark dirt, water stains, and scratches on the underlying car NEVER bleed through!
-                float sceneLight = lerp(0.88, 1.12, smoothstep(0.22, 0.78, rawLuma));
+            float3 hsv2rgb(float3 c)
+            {
+                float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+                float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+                return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
+            }
 
-                // 2. Crisp mechanical panel seams (door shutlines, hood gaps)
-                // Filtered with a threshold so surface blemishes/dirt (gradient < 0.14) do NOT trigger shadow
+            float2 GetSmoothedUV(float2 uv, float2 texSize)
+            {
+                float2 pixel = uv * texSize - 0.5;
+                float2 f = frac(pixel);
+                // C2 continuous quintic Hermite polynomial: 6f^5 - 15f^4 + 10f^3
+                float2 s = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+                return (floor(pixel) + 0.5 + s) / texSize;
+            }
+
+            float2 GetMaskUV(float2 screenUV)
+            {
+                if (_LetterboxAspect < 0.95 && _LetterboxAspect > 0.1)
+                {
+                    float offsetY = (1.0 - _LetterboxAspect) * 0.5;
+                    float maskY = (screenUV.y - offsetY) / _LetterboxAspect;
+                    return float2(screenUV.x, maskY);
+                }
+                return screenUV;
+            }
+
+            float SampleAntiAliasedMask(float2 maskUV)
+            {
+                if (maskUV.y < 0.0 || maskUV.y > 1.0 || maskUV.x < 0.0 || maskUV.x > 1.0)
+                    return 0.0;
+                float2 texSize = float2(384.0, 384.0);
+                float2 smUV = GetSmoothedUV(maskUV, texSize);
+                return SAMPLE_TEXTURE2D(_MaskTex, sampler_MaskTex, smUV).r;
+            }
+
+            half3 ShadePaint(float mask, float3 sceneLinear, float2 uv)
+            {
+                // Convert Linear inputs to perceptual sRGB for lighting calculations
+                float3 tintSrgb = pow(max(_Tint.rgb, 0.0), 1.0 / 2.2);
+                float targetLuma = dot(tintSrgb, float3(0.299, 0.587, 0.114));
+
+                float3 sceneSrgb = pow(max(sceneLinear, 0.0), 1.0 / 2.2);
+                float rawLuma = dot(sceneSrgb, float3(0.299, 0.587, 0.114));
+                float normShade = saturate((rawLuma - 0.05) / 0.85);
+
+                // Crisp shutlines / panel gaps (DDX/DDY on perceptual luma)
                 float lumaDx = ddx(rawLuma);
                 float lumaDy = ddy(rawLuma);
                 float grad = sqrt(lumaDx * lumaDx + lumaDy * lumaDy);
-                float seam = saturate((grad - 0.13) * 4.5);
-                float ao = clamp(1.0 - seam * 0.32, 0.68, 1.0);
+                float seam = saturate((grad - 0.10) * 6.0);
+                float ao = clamp(1.0 - seam * 0.35, 0.65, 1.0);
 
-                // 3. PBR Finish-dependent parameters
-                float paintLuma = dot(_Tint.rgb, float3(0.299, 0.587, 0.114));
-                
-                float clearcoatF0 = 0.04;
-                float clearcoatGrazing = lerp(0.18, 0.48, _Smoothness);
-                float specPower = lerp(16.0, 72.0, _Smoothness);
+                float3 diffuse = float3(0, 0, 0);
+                float3 specular = float3(0, 0, 0);
 
-                if (paintLuma < 0.12)
+                // Finish Modes: 0=gloss, 1=matte, 2=satin, 3=metallic, 4=candy, 5=carbon
+                if (_Finish > 0.5 && _Finish < 1.5)
                 {
-                    // Showroom Obsidian / Gloss Black:
-                    // Rich deep black pigment + glass-like specular & environment reflections
-                    clearcoatF0 = 0.06;
-                    clearcoatGrazing = 0.60;
+                    // === 1. MATTE FINISH (0% clearcoat glint, deep solid basecoat) ===
+                    if (targetLuma < 0.15)
+                    {
+                        // True Automotive Matte Black (deep velvet stealth)
+                        float bodyLuma = 0.030 + 0.048 * normShade;
+                        float velvetSheen = pow(normShade, 2.0) * 0.012;
+                        diffuse = (float3(bodyLuma, bodyLuma, bodyLuma + 0.002) + velvetSheen) * ao;
+                    }
+                    else
+                    {
+                        diffuse = tintSrgb * clamp(0.70 + 0.30 * normShade, 0.65, 1.05) * ao;
+                    }
+                    specular = float3(0, 0, 0);
                 }
-                else if (paintLuma > 0.72)
+                else if (_Finish > 1.5 && _Finish < 2.5)
                 {
-                    // Metallic Silver / Pure White
-                    clearcoatF0 = 0.03;
-                    clearcoatGrazing = 0.32;
+                    // === 2. SATIN FINISH (soft muted sheen) ===
+                    if (targetLuma < 0.15)
+                    {
+                        float bodyLuma = 0.022 + 0.052 * normShade;
+                        diffuse = float3(bodyLuma, bodyLuma, bodyLuma + 0.003) * ao;
+                    }
+                    else
+                    {
+                        diffuse = tintSrgb * clamp(0.58 + 0.42 * normShade, 0.52, 1.10) * ao;
+                    }
+                    float directGlint = pow(saturate((rawLuma - 0.75) / 0.25), 18.0);
+                    specular = float3(1.0, 0.99, 0.97) * directGlint * 0.25;
                 }
-
-                half3 effectiveTint = (paintLuma < 0.12) ? max(_Tint.rgb, half3(0.07, 0.07, 0.07)) : _Tint.rgb;
-
-                // 4. 100% Opaque Pigment Vinyl Basecoat: completely covers blemishes, scratches, and old paint!
-                float totalIllum = macroLight * sceneLight;
-                half3 diffuse = effectiveTint * (0.45 * _AmbientLightColor.rgb + 0.55 * totalIllum) * ao;
-
-                // 5. Dielectric Clearcoat Specular Highlight & Sky Fresnel Reflection (Additive)
-                float2 maskGrad = float2(ddx(mask), ddy(mask));
-                float edgeCurvature = saturate(length(maskGrad) * 4.5);
-                float fresnel = clearcoatF0 + (clearcoatGrazing - clearcoatF0) * pow(edgeCurvature, 1.25);
-
-                // Sun / overhead light specular glint
-                float directGlint = pow(saturate((rawLuma - 0.62) / 0.38), specPower / 6.0);
-                half3 glintColor = half3(1.0, 0.99, 0.97) * directGlint * 0.65;
-
-                // Environment sky reflection along vehicle curvature
-                half3 envReflect = scene * fresnel * 0.90;
-                half3 specular = (glintColor + envReflect) * _Smoothness;
-
-                // Metallic flake micro-sparkle in midtones
-                if (_Metallic > 0.25)
+                else if (_Finish > 2.5 && _Finish < 3.5)
                 {
-                    float flake = saturate(abs(lumaDx) + abs(lumaDy)) * _Metallic * 0.35;
-                    diffuse *= (1.0 + flake);
+                    // === 3. METALLIC FINISH (metallic micro-flake + specular glints) ===
+                    float flake = saturate(abs(lumaDx) + abs(lumaDy)) * 0.28;
+                    diffuse = tintSrgb * clamp(0.50 + 0.52 * normShade, 0.45, 1.15) * (1.0 + flake) * ao;
+                    float directGlint = pow(saturate((rawLuma - 0.70) / 0.30), 32.0);
+                    specular = float3(1.0, 0.99, 0.97) * directGlint * 0.60;
                 }
-
-                // Procedural Carbon Fiber weave if finish is carbon
-                if (_Metallic > 0.80 && _Smoothness > 0.85 && _Metallic < 0.90)
+                else if (_Finish > 3.5 && _Finish < 4.5)
                 {
+                    // === 4. CANDY FINISH (high-contrast deep undertones + vibrant glowing midtones) ===
+                    float normCandy = pow(normShade, 1.15);
+                    float3 deepBase = tintSrgb * 0.62;
+                    float3 brightMid = tintSrgb * 1.28;
+                    diffuse = lerp(deepBase, brightMid, normCandy) * ao;
+                    float directGlint = pow(saturate((rawLuma - 0.68) / 0.32), 36.0);
+                    specular = float3(1.0, 0.98, 0.95) * directGlint * 0.70;
+                }
+                else if (_Finish >= 4.5)
+                {
+                    // === 5. CARBON FIBER ===
                     float2 carbonUV = frac(uv * 140.0);
-                    float carbonWeave = ((carbonUV.x > 0.5) ^ (carbonUV.y > 0.5)) ? 0.84 : 1.16;
-                    diffuse *= carbonWeave;
+                    float carbonWeave = ((carbonUV.x > 0.5) ^ (carbonUV.y > 0.5)) ? 0.82 : 1.18;
+                    diffuse = float3(0.038, 0.038, 0.042) * carbonWeave * lerp(0.6, 1.2, normShade) * ao;
+                    float directGlint = pow(saturate((rawLuma - 0.72) / 0.28), 24.0);
+                    specular = float3(1.0, 0.99, 0.97) * directGlint * 0.40;
+                }
+                else
+                {
+                    // === 0. GLOSS SHOWROOM FINISH (Obsidian / Solid Base + Dielectric Specular) ===
+                    if (targetLuma < 0.15)
+                    {
+                        // Showroom Gloss Black: pure deep black base with pinpoint specular highlight
+                        diffuse = float3(0.016, 0.016, 0.020) * lerp(0.5, 1.25, normShade) * ao;
+                        float directGlint = pow(saturate((rawLuma - 0.72) / 0.28), 28.0);
+                        specular = float3(1.0, 0.99, 0.97) * directGlint * 0.65;
+                    }
+                    else
+                    {
+                        diffuse = tintSrgb * clamp(0.48 + 0.54 * normShade, 0.42, 1.15) * ao;
+                        float directGlint = pow(saturate((rawLuma - 0.74) / 0.26), 24.0);
+                        specular = float3(1.0, 0.99, 0.97) * directGlint * 0.48;
+                    }
                 }
 
-                return saturate(diffuse + specular);
+                // Combine diffuse and specular in perceptual sRGB, then convert back to Linear for URP
+                float3 paintSrgb = saturate(diffuse + specular);
+                return pow(paintSrgb, 2.2);
             }
 
             Varyings vert(Attributes input)
@@ -200,29 +275,41 @@ Shader "ARCar/LivePaint"
 
             half4 frag(Varyings input) : SV_Target
             {
-                float3 maskSample = SAMPLE_TEXTURE2D(_MaskTex, sampler_MaskTex, input.uv).rgb;
+                // ARCore 6DoF continuous tracking offset between inferences
+                float2 maskUV = GetMaskUV(input.uv - _MaskUVOffset.xy);
+                float3 rawSample = (maskUV.y < 0.0 || maskUV.y > 1.0 || maskUV.x < 0.0 || maskUV.x > 1.0)
+                    ? float3(0, 0, 0)
+                    : SAMPLE_TEXTURE2D(_MaskTex, sampler_MaskTex, maskUV).rgb;
                 float2 screenUV = GetNormalizedScreenSpaceUV(input.positionHCS);
 
                 // Live License Plate Privacy Blur: worker encodes plate region as R=0, B=1
-                if (maskSample.r < 0.04 && maskSample.b > 0.82)
+                if (rawSample.r < 0.04 && rawSample.b > 0.82)
                 {
                     half3 blurredPlate = SampleBlurredPlate(screenUV, input.uv);
                     return half4(blurredPlate, 0.98);
                 }
 
-                float mask = maskSample.r * PanelGate(input.uv, _Panel);
-                // Cutoff uncertain noise while ensuring full sheet metal coverage
-                if (mask < 0.10) discard;
+                float smoothMask = SampleAntiAliasedMask(maskUV);
+                float mask = smoothMask * PanelGate(input.uv, _Panel);
 
-                float3 opaqueScene = SampleSceneColor(screenUV);
-                float3 camScene = SAMPLE_TEXTURE2D(_SceneTex, sampler_SceneTex, input.uv).rgb;
-                float3 scene = max(opaqueScene, camScene);
+                // Sample fresh camera scene directly from URP camera buffer
+                float3 scene = SampleSceneColor(screenUV);
 
-                half3 paintRgb = ShadePaint(maskSample, scene, input.uv);
+                half3 paintRgb = ShadePaint(mask, scene, input.uv);
 
-                // Full sheet metal coverage up to rubber gaskets with smooth anti-aliased edge
-                float alpha = smoothstep(0.12, 0.35, mask) * ((_Strength > 0.01) ? 1.0 : 0.0);
-                if (alpha < 0.005) discard;
+                float rawLuma = dot(scene, float3(0.299, 0.587, 0.114));
+                float lumaDx = ddx(rawLuma);
+                float lumaDy = ddy(rawLuma);
+                float grad = sqrt(lumaDx * lumaDx + lumaDy * lumaDy);
+                float seam = saturate((grad - 0.10) * 6.0);
+
+                // Solid 100% opaque basecoat inside sheet metal (0% transparency on white car)
+                // Controlled edge-snap anti-aliasing in [0.18, 0.32] prevents spill onto pavers
+                float edgeSnap = saturate(1.0 - seam * 0.40);
+                float edgeAlpha = smoothstep(0.18, 0.32, mask) * edgeSnap;
+                float alpha = (mask > 0.32) ? 1.0 : edgeAlpha;
+                alpha *= ((_Strength > 0.01) ? 1.0 : 0.0);
+                if (alpha < 0.01) discard;
 
                 return half4(paintRgb, alpha);
             }
@@ -252,6 +339,9 @@ Shader "ARCar/LivePaint"
             float _Metallic;
             float _Smoothness;
             float _Panel;
+            float _Finish;
+            float4 _MaskUVOffset;
+            float _LetterboxAspect;
 
             struct appdata
             {
@@ -295,10 +385,58 @@ Shader "ARCar/LivePaint"
                 return output;
             }
 
+            float3 rgb2hsv(float3 c)
+            {
+                float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+                float4 p = lerp(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
+                float4 q = lerp(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
+                float d = q.x - min(q.w, q.y);
+                float e = 1.0e-10;
+                return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+            }
+
+            float3 hsv2rgb(float3 c)
+            {
+                float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+                float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+                return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
+            }
+
+            float2 GetSmoothedUVCG(float2 uv, float2 texSize)
+            {
+                float2 pixel = uv * texSize - 0.5;
+                float2 f = frac(pixel);
+                float2 s = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+                return (floor(pixel) + 0.5 + s) / texSize;
+            }
+
+            float2 GetMaskUVCG(float2 screenUV)
+            {
+                if (_LetterboxAspect < 0.95 && _LetterboxAspect > 0.1)
+                {
+                    float offsetY = (1.0 - _LetterboxAspect) * 0.5;
+                    float maskY = (screenUV.y - offsetY) / _LetterboxAspect;
+                    return float2(screenUV.x, maskY);
+                }
+                return screenUV;
+            }
+
+            float SampleAntiAliasedMaskCG(float2 maskUV)
+            {
+                if (maskUV.y < 0.0 || maskUV.y > 1.0 || maskUV.x < 0.0 || maskUV.x > 1.0)
+                    return 0.0;
+                float2 texSize = float2(384.0, 384.0);
+                float2 smUV = GetSmoothedUVCG(maskUV, texSize);
+                return tex2D(_MaskTex, smUV).r;
+            }
+
             fixed4 frag(v2f input) : SV_Target
             {
-                float3 maskSample = tex2D(_MaskTex, input.uv).rgb;
-                if (maskSample.r < 0.04 && maskSample.b > 0.82)
+                float2 maskUV = GetMaskUVCG(input.uv - _MaskUVOffset.xy);
+                float3 rawSample = (maskUV.y < 0.0 || maskUV.y > 1.0 || maskUV.x < 0.0 || maskUV.x > 1.0)
+                    ? float3(0, 0, 0)
+                    : tex2D(_MaskTex, maskUV).rgb;
+                if (rawSample.r < 0.04 && rawSample.b > 0.82)
                 {
                     float3 blurAcc = 0;
                     float2 stepUV = float2(0.008, 0.006);
@@ -312,29 +450,109 @@ Shader "ARCar/LivePaint"
                     return fixed4(blurAcc / 9.0, 0.98);
                 }
 
-                float mask = maskSample.r * PanelGate(input.uv, _Panel);
-                if (mask < 0.10) discard;
+                float smoothMask = SampleAntiAliasedMaskCG(maskUV);
+                float mask = smoothMask * PanelGate(input.uv, _Panel);
 
-                float3 scene = tex2D(_SceneTex, input.uv).rgb;
-                float rawLuma = dot(scene, float3(0.299, 0.587, 0.114));
+                float3 sceneLinear = tex2D(_SceneTex, input.uv).rgb;
+                float3 tintSrgb = pow(max(_Tint.rgb, 0.0), 1.0 / 2.2);
+                float targetLuma = dot(tintSrgb, float3(0.299, 0.587, 0.114));
 
-                float macroLight = lerp(0.85, 1.15, saturate(1.0 - input.uv.y * 0.75));
-                float sceneLight = lerp(0.85, 1.15, smoothstep(0.22, 0.78, rawLuma));
+                float3 sceneSrgb = pow(max(sceneLinear, 0.0), 1.0 / 2.2);
+                float rawLuma = dot(sceneSrgb, float3(0.299, 0.587, 0.114));
+                float normShade = saturate((rawLuma - 0.05) / 0.85);
 
-                float paintLuma = dot(_Tint.rgb, float3(0.299, 0.587, 0.114));
-                fixed3 baseTint = (paintLuma < 0.12) ? max(_Tint.rgb, fixed3(0.07, 0.07, 0.07)) : _Tint.rgb;
+                float lumaDx = ddx(rawLuma);
+                float lumaDy = ddy(rawLuma);
+                float grad = sqrt(lumaDx * lumaDx + lumaDy * lumaDy);
+                float seam = saturate((grad - 0.10) * 6.0);
+                float ao = clamp(1.0 - seam * 0.35, 0.65, 1.0);
 
-                // 100% Opaque Pigment Vinyl Basecoat
-                fixed3 diffuse = baseTint * (macroLight * sceneLight * 0.90);
+                float3 diffuse = float3(0, 0, 0);
+                float3 specular = float3(0, 0, 0);
 
-                // Dielectric Specular Glint & Environmental Sheen (Additive)
-                float directGlint = pow(saturate((rawLuma - 0.62) / 0.38), lerp(2.0, 16.0, _Smoothness));
-                fixed3 specColor = fixed3(1.0, 0.99, 0.97) * directGlint * _Smoothness * 0.60;
-                fixed3 envSheen = scene * (0.28 * _Smoothness);
+                if (_Finish > 0.5 && _Finish < 1.5)
+                {
+                    // Matte
+                    if (targetLuma < 0.15)
+                    {
+                        float bodyLuma = 0.030 + 0.048 * normShade;
+                        float velvetSheen = pow(normShade, 2.0) * 0.012;
+                        diffuse = (float3(bodyLuma, bodyLuma, bodyLuma + 0.002) + velvetSheen) * ao;
+                    }
+                    else
+                    {
+                        diffuse = tintSrgb * clamp(0.70 + 0.30 * normShade, 0.65, 1.05) * ao;
+                    }
+                    specular = float3(0, 0, 0);
+                }
+                else if (_Finish > 1.5 && _Finish < 2.5)
+                {
+                    // Satin
+                    if (targetLuma < 0.15)
+                    {
+                        float bodyLuma = 0.022 + 0.052 * normShade;
+                        diffuse = float3(bodyLuma, bodyLuma, bodyLuma + 0.003) * ao;
+                    }
+                    else
+                    {
+                        diffuse = tintSrgb * clamp(0.58 + 0.42 * normShade, 0.52, 1.10) * ao;
+                    }
+                    float directGlint = pow(saturate((rawLuma - 0.75) / 0.25), 18.0);
+                    specular = float3(1.0, 0.99, 0.97) * directGlint * 0.25;
+                }
+                else if (_Finish > 2.5 && _Finish < 3.5)
+                {
+                    // Metallic
+                    float flake = saturate(abs(lumaDx) + abs(lumaDy)) * 0.28;
+                    diffuse = tintSrgb * clamp(0.50 + 0.52 * normShade, 0.45, 1.15) * (1.0 + flake) * ao;
+                    float directGlint = pow(saturate((rawLuma - 0.70) / 0.30), 32.0);
+                    specular = float3(1.0, 0.99, 0.97) * directGlint * 0.60;
+                }
+                else if (_Finish > 3.5 && _Finish < 4.5)
+                {
+                    // Candy
+                    float normCandy = pow(normShade, 1.15);
+                    float3 deepBase = tintSrgb * 0.62;
+                    float3 brightMid = tintSrgb * 1.28;
+                    diffuse = lerp(deepBase, brightMid, normCandy) * ao;
+                    float directGlint = pow(saturate((rawLuma - 0.68) / 0.32), 36.0);
+                    specular = float3(1.0, 0.98, 0.95) * directGlint * 0.70;
+                }
+                else if (_Finish >= 4.5)
+                {
+                    // Carbon
+                    float2 carbonUV = frac(input.uv * 140.0);
+                    float carbonWeave = ((carbonUV.x > 0.5) ^ (carbonUV.y > 0.5)) ? 0.82 : 1.18;
+                    diffuse = float3(0.038, 0.038, 0.042) * carbonWeave * lerp(0.6, 1.2, normShade) * ao;
+                    float directGlint = pow(saturate((rawLuma - 0.72) / 0.28), 24.0);
+                    specular = float3(1.0, 0.99, 0.97) * directGlint * 0.40;
+                }
+                else
+                {
+                    // Gloss
+                    if (targetLuma < 0.15)
+                    {
+                        diffuse = float3(0.016, 0.016, 0.020) * lerp(0.5, 1.25, normShade) * ao;
+                        float directGlint = pow(saturate((rawLuma - 0.72) / 0.28), 28.0);
+                        specular = float3(1.0, 0.99, 0.97) * directGlint * 0.65;
+                    }
+                    else
+                    {
+                        diffuse = tintSrgb * clamp(0.48 + 0.54 * normShade, 0.42, 1.15) * ao;
+                        float directGlint = pow(saturate((rawLuma - 0.74) / 0.26), 24.0);
+                        specular = float3(1.0, 0.99, 0.97) * directGlint * 0.48;
+                    }
+                }
 
-                float alpha = smoothstep(0.12, 0.35, mask) * ((_Strength > 0.01) ? 1.0 : 0.0);
-                if (alpha < 0.005) discard;
-                return fixed4(saturate(diffuse + specColor + envSheen), alpha);
+                float3 paintSrgb = saturate(diffuse + specular);
+                fixed3 paintLinear = pow(paintSrgb, 2.2);
+
+                float edgeSnap = saturate(1.0 - seam * 0.40);
+                float edgeAlpha = smoothstep(0.18, 0.32, mask) * edgeSnap;
+                float alpha = (mask > 0.32) ? 1.0 : edgeAlpha;
+                alpha *= ((_Strength > 0.01) ? 1.0 : 0.0);
+                if (alpha < 0.01) discard;
+                return fixed4(paintLinear, alpha);
             }
             ENDCG
         }

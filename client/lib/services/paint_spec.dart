@@ -26,7 +26,7 @@ class PaintSpec {
   }
 
   static String? hexFromBundle(String spec) {
-    final match = RegExp(r'color:#([0-9a-fA-F]{6})').firstMatch(spec);
+    final match = RegExp(r'(?:color:)?#([0-9a-fA-F]{6})').firstMatch(spec);
     if (match == null) return null;
     return '#${match.group(1)!.toUpperCase()}';
   }

@@ -18,15 +18,16 @@ public class BuildCommand
             throw new Exception("[VerifySentis] CarSegMask ModelAsset is null in Resources!");
 
         var model = ModelLoader.Load(modelAsset);
+        const int SentisDim = 384;
         using var worker = new Worker(model, BackendType.CPU);
-        using var blankTensor = new Tensor<float>(new TensorShape(1, 3, 256, 256));
+        using var blankTensor = new Tensor<float>(new TensorShape(1, 3, SentisDim, SentisDim));
         worker.Schedule(blankTensor);
         var blankOut = (worker.PeekOutput() as Tensor<float>).ReadbackAndClone();
         float blankMax = 0f;
         for (int i = 0; i < blankOut.count; i++)
             if (blankOut[i] > blankMax) blankMax = blankOut[i];
         blankOut.Dispose();
-        Debug.Log($"[VerifySentis] Blank 256x256 tensor max = {blankMax:F5}");
+        Debug.Log($"[VerifySentis] Blank {SentisDim}x{SentisDim} tensor max = {blankMax:F5}");
         if (blankMax > 0.05f)
             throw new Exception($"[VerifySentis] Blank tensor max too high: {blankMax}");
 
@@ -39,16 +40,16 @@ public class BuildCommand
             var tex = new Texture2D(2, 2);
             tex.LoadImage(bytes);
 
-            // Crop top half (Unity viewport) and resize to 256x256 on CPU to verify worker execution in batchmode
-            using var imgTensor = new Tensor<float>(new TensorShape(1, 3, 256, 256));
+            // Crop top half (Unity viewport) and resize to SentisDim on CPU to verify worker execution in batchmode
+            using var imgTensor = new Tensor<float>(new TensorShape(1, 3, SentisDim, SentisDim));
             int cropH = tex.height / 2;
-            for (int y = 0; y < 256; y++)
+            for (int y = 0; y < SentisDim; y++)
             {
                 // y=0 is top of image; Texture2D.GetPixelBilinear has v=1 at top, v=0.5 at middle of full screenshot
-                float v = 1.0f - (y / 255.0f) * 0.5f;
-                for (int x = 0; x < 256; x++)
+                float v = 1.0f - (y / (float)(SentisDim - 1)) * 0.5f;
+                for (int x = 0; x < SentisDim; x++)
                 {
-                    float u = x / 255.0f;
+                    float u = x / (float)(SentisDim - 1);
                     Color c = tex.GetPixelBilinear(u, v);
                     imgTensor[0, 0, y, x] = c.r;
                     imgTensor[0, 1, y, x] = c.g;

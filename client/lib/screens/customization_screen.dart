@@ -1,12 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_unity_widget/flutter_unity_widget.dart';
 import 'package:graphql_flutter/graphql_flutter.dart';
-import 'package:share_plus/share_plus.dart';
 
 import '../models/asset.dart';
 import '../models/car.dart';
@@ -14,6 +14,7 @@ import '../services/auth_session.dart';
 import '../services/graphql_service.dart';
 import '../services/paint_spec.dart';
 import '../services/unity_commands.dart';
+import '../widgets/hd_showroom_viewer.dart';
 
 class CustomizationScreen extends StatefulWidget {
   final Car car;
@@ -31,6 +32,37 @@ class CustomizationScreen extends StatefulWidget {
   State<CustomizationScreen> createState() => _CustomizationScreenState();
 }
 
+class AuthoritativePaintState {
+  final String colorHex;
+  final String finish;
+  final String panel;
+  final String assetName;
+  final int version;
+
+  const AuthoritativePaintState({
+    required this.colorHex,
+    required this.finish,
+    required this.panel,
+    required this.assetName,
+    required this.version,
+  });
+
+  AuthoritativePaintState copyWith({
+    String? colorHex,
+    String? finish,
+    String? panel,
+    String? assetName,
+  }) {
+    return AuthoritativePaintState(
+      colorHex: colorHex ?? this.colorHex,
+      finish: finish ?? this.finish,
+      panel: panel ?? this.panel,
+      assetName: assetName ?? this.assetName,
+      version: version + 1,
+    );
+  }
+}
+
 class _CustomizationScreenState extends State<CustomizationScreen> {
   final Map<String, Asset> _selected = {};
   List<Asset> _catalogAssets = const [];
@@ -46,13 +78,80 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   bool _hasActiveMask = false;
   bool _sentisLiveActive = false;
   Uint8List? _lastGoodPolishedBytes;
+  Uint8List? _lastRawSnapshotBytes;
   String _finish = 'gloss';
   String _panel = 'body';
+  String _coverageMode = 'true-to-life';
   String? _paintColor = '#9B1B30';
   final _hex = TextEditingController();
   int _maskSlot = 0;
+  int _requestSequence = 0;
+  int _latestProcessedSequence = 0;
+  int _studioShareRetryCount = 0;
+  late AuthoritativePaintState _paintState;
+
+  @override
+  void initState() {
+    super.initState();
+    final defaultAsset = _defaultCatalog.firstWhere(
+      (a) => a.type == 'PAINT',
+      orElse: () => _defaultCatalog.first,
+    );
+    final defaultFinish = PaintSpec.finishFrom(defaultAsset.materialBundleUrl, defaultAsset.name);
+    final defaultColor = PaintSpec.colorToken(defaultAsset.materialBundleUrl, defaultAsset.name);
+    _selected['PAINT'] = defaultAsset;
+    _finish = defaultFinish;
+    _paintColor = defaultColor;
+    _panel = 'body';
+    _paintState = AuthoritativePaintState(
+      colorHex: defaultColor,
+      finish: defaultFinish,
+      panel: 'body',
+      assetName: defaultAsset.name,
+      version: 1,
+    );
+  }
+
+  void _updatePaintState({String? color, String? finish, String? panel, String? assetName, Asset? asset}) {
+    final nextColor = color ?? _paintState.colorHex;
+    final nextFinish = finish ?? _paintState.finish;
+    final nextPanel = panel ?? _paintState.panel;
+    final nextName = assetName ?? (asset != null ? asset.name : _paintState.assetName);
+
+    setState(() {
+      _paintColor = nextColor;
+      _finish = nextFinish;
+      _panel = nextPanel;
+      if (asset != null) {
+        _selected['PAINT'] = asset;
+      }
+      _paintState = _paintState.copyWith(
+        colorHex: nextColor,
+        finish: nextFinish,
+        panel: nextPanel,
+        assetName: nextName,
+      );
+    });
+
+    _sendPaint(color: nextColor, finish: nextFinish, panel: nextPanel);
+    if (!_sentisLiveActive) {
+      _startLiveFilter();
+    }
+  }
+
+  bool _isWalkaroundScanning = false;
+  bool _isCapturingWalkaroundAngle = false;
+  int _walkaroundStep = 0;
+  String _walkaroundStepPrompt = '';
+  final List<String> _walkaroundSnapPaths = [];
+  final List<String> _walkaroundAngleLabels = [
+    'Front 3/4 View',
+    'Driver Side Profile',
+    'Rear 3/4 View',
+  ];
 
   String get _displayVehicleTitle {
+
     if (_customVehicleTitle != null && _customVehicleTitle!.trim().isNotEmpty) {
       return _customVehicleTitle!.trim();
     }
@@ -180,6 +279,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
 
   Future<void> _captureHdStudioCut() async {
     if (_unityController == null || _sharingPhoto || _maskingBusy) return;
+    _studioShareRetryCount = 0;
     setState(() {
       _sharingPhoto = true;
       _capturingForStudioShare = true;
@@ -188,7 +288,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     });
 
     _post(UnityCommands.captureSnapshot(clean: true));
-    Future<void>.delayed(const Duration(seconds: 7), () {
+    Future<void>.delayed(const Duration(seconds: 18), () {
       if (!mounted || !_capturingForStudioShare) return;
       setState(() {
         _capturingForStudioShare = false;
@@ -200,90 +300,28 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   }
 
 
+  String get _currentPaintDisplayTitle {
+    final assetName = _selected['PAINT']?.name;
+    final curFinCap = _finish.isNotEmpty ? '${_finish[0].toUpperCase()}${_finish.substring(1).toLowerCase()}' : 'Custom';
+    if (assetName == null) return '$curFinCap Paint';
+    final finishes = ['Gloss', 'Matte', 'Satin', 'Metallic', 'Candy', 'Carbon'];
+    for (final f in finishes) {
+      if (assetName.contains(f)) {
+        return assetName.replaceAll(f, curFinCap);
+      }
+    }
+    return '$curFinCap $assetName';
+  }
+
   void _showHdShowroomSheet(Uint8List polishedBytes) {
-    final paintName = _selected['PAINT']?.name ?? 'Custom Paint';
-    final hexLabel = _paintColor ?? '#9B1B30';
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: const Color(0xFF141820),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
-      ),
-      builder: (ctx) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  children: [
-                    const Icon(Icons.hd, color: Color(0xFF00E5FF), size: 22),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Showroom HD Cut · $paintName ($hexLabel)',
-                        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.close, color: Colors.white70),
-                      onPressed: () => Navigator.pop(ctx),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(14),
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      maxHeight: MediaQuery.of(ctx).size.height * 0.52,
-                    ),
-                    child: Image.memory(
-                      polishedBytes,
-                      fit: BoxFit.contain,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: () => Navigator.pop(ctx),
-                        icon: const Icon(Icons.videocam, size: 18),
-                        label: const Text('Back to Live AR'),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        onPressed: () async {
-                          final tempFile = File(
-                            '${Directory.systemTemp.path}/autocraft-hd-${DateTime.now().millisecondsSinceEpoch}.jpg',
-                          );
-                          await tempFile.writeAsBytes(polishedBytes, flush: true);
-                          if (ctx.mounted) Navigator.pop(ctx);
-                          await Share.shareXFiles(
-                            [XFile(tempFile.path)],
-                            text:
-                                'Auto-Body Shop HD Paint Reference · $_displayVehicleTitle · $paintName ($hexLabel) · Finish: ${_finish.toUpperCase()}',
-                          );
-                        },
-                        icon: const Icon(Icons.ios_share, size: 18),
-                        label: const Text('Save / Share HD'),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        );
-      },
+    HdShowroomViewer.show(
+      context,
+      polishedBytes: polishedBytes,
+      originalBytes: _lastRawSnapshotBytes,
+      paintName: _currentPaintDisplayTitle,
+      hexColor: _paintState.colorHex,
+      finish: _paintState.finish,
+      vehicleTitle: _displayVehicleTitle,
     );
   }
 
@@ -325,6 +363,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
               'panel': _panel,
               'repolishOnly': false,
               'hdMode': false,
+              'fullCoverage': _coverageMode == 'full',
             },
           },
         ),
@@ -380,41 +419,22 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     }
   }
 
-  /// Studio photo polisher: used ONLY when exporting/sharing the Auto-Body Shop Reference still.
-  /// Never covers the live camera viewport.
+  /// Studio photo polisher: delegates directly to Showroom HD Studio Cut
   Future<void> _exportBodyShopReference() async {
-    if (_unityController == null || _sharingPhoto || _maskingBusy) return;
-    setState(() {
-      _sharingPhoto = true;
-      _capturingForStudioShare = true;
-      _capturingForMask = false;
-      _unityStatus = 'Polishing studio reference photo for share…';
-    });
-
-    _post(UnityCommands.captureSnapshot(clean: true));
-    Future<void>.delayed(const Duration(seconds: 6), () {
-      if (!mounted || !_capturingForStudioShare) return;
-      setState(() {
-        _capturingForStudioShare = false;
-        _sharingPhoto = false;
-      });
-      _snack('Snapshot timed out.');
-    });
+    await _captureHdStudioCut();
   }
 
-  Future<void> _processStudioShareSnapshot(String path) async {
-    final file = File(path);
-    if (!await file.exists()) {
-      if (!mounted) return;
-      setState(() => _sharingPhoto = false);
-      _snack('The camera frame was not written.');
-      return;
-    }
 
-    Uint8List? rawBytes;
+  Future<ShowroomAngleCut?> _polishSingleAngle(String path, String label, {int retryCount = 0}) async {
+    final file = File(path);
+    if (!await file.exists()) return null;
+
+    final seq = ++_requestSequence;
+    final activePaint = _paintState;
+
     try {
-      rawBytes = await file.readAsBytes();
-      if (!mounted) return;
+      final rawBytes = await file.readAsBytes();
+      if (!mounted) return null;
       final client = GraphQLProvider.of(context).value;
       final result = await client.mutate(
         MutationOptions(
@@ -423,48 +443,182 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
           variables: {
             'input': {
               'imageBase64': base64Encode(rawBytes),
-              'mimeType': 'image/png',
-              'hexColor': _paintColor ?? '#9B1B30',
-              'finish': _finish,
-              'panel': _panel,
+              'mimeType': 'image/jpeg',
+              'hexColor': activePaint.colorHex,
+              'finish': activePaint.finish,
+              'panel': activePaint.panel,
               'repolishOnly': false,
               'hdMode': true,
+              'fullCoverage': _coverageMode == 'full',
+              'frameId': 'req_$seq',
             },
           },
         ),
       );
 
+      // Monotonic sequence guard: if a newer request was dispatched, discard stale response
+      if (seq < _latestProcessedSequence) {
+        return null;
+      }
+      _latestProcessedSequence = seq;
+
       final data = result.data?['segmentLiveCar'] as Map<String, dynamic>?;
       final polishedB64 = data?['polishedBase64'] as String?;
-      if (polishedB64 != null && polishedB64.isNotEmpty) {
-        final bytes = base64Decode(polishedB64);
-        _lastGoodPolishedBytes = bytes;
-        if (!mounted) return;
-        setState(() {
-          _sharingPhoto = false;
-          _unityStatus = '🟢 Live AR Customizer · 60 FPS';
-        });
-        _showHdShowroomSheet(bytes);
-        return;
-      }
+      final isMasked = data?['masked'] == true;
 
-      // Instant high-res fallback: show captured customized car photo directly in the HD Showroom sheet!
-      if (!mounted) return;
-      setState(() {
-        _sharingPhoto = false;
-        _unityStatus = '🟢 Live AR Customizer · 60 FPS';
-      });
-      _showHdShowroomSheet(rawBytes);
-    } catch (error) {
-      if (!mounted) return;
-      setState(() => _sharingPhoto = false);
-      if (rawBytes != null) {
-        _showHdShowroomSheet(rawBytes);
-      } else {
-        _snack('Studio snapshot error: $error');
+      if (!result.hasException && isMasked && polishedB64 != null && polishedB64.isNotEmpty) {
+        final bytes = base64Decode(polishedB64);
+        return ShowroomAngleCut(label: label, polishedBytes: bytes, originalBytes: rawBytes);
+      }
+    } catch (_) {
+      if (retryCount < 1) {
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+        return _polishSingleAngle(path, label, retryCount: retryCount + 1);
       }
     }
+    return null;
   }
+
+  Future<void> _processStudioShareSnapshot(String path) async {
+    final cut = await _polishSingleAngle(path, 'Front Studio View');
+    if (!mounted) return;
+
+    if (cut != null) {
+      _studioShareRetryCount = 0;
+      setState(() {
+        _sharingPhoto = false;
+        _capturingForStudioShare = false;
+        _unityStatus = '🟢 Live AR Customizer · 60 FPS';
+      });
+      _lastGoodPolishedBytes = cut.polishedBytes;
+      _lastRawSnapshotBytes = cut.originalBytes;
+      _showHdShowroomSheet(cut.polishedBytes);
+      return;
+    }
+
+    // Cold-start fresh frame retry: if 1st frame had paintPixels < 400 or failed isolation,
+    // wait 800ms for camera auto-exposure to settle, take ONE fresh camera snapshot, and polish that!
+    if (_studioShareRetryCount < 1 && _unityController != null) {
+      _studioShareRetryCount++;
+      setState(() {
+        _sharingPhoto = true;
+        _capturingForStudioShare = true;
+        _unityStatus = 'Refining camera focus & isolation…';
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      if (!mounted) return;
+      _post(UnityCommands.captureSnapshot(clean: true));
+      return;
+    }
+
+    // Both consecutive fresh frames failed: show clear guidance toast
+    _studioShareRetryCount = 0;
+    setState(() {
+      _sharingPhoto = false;
+      _capturingForStudioShare = false;
+      _unityStatus = '🟢 Live AR Customizer · 60 FPS';
+    });
+    _snack('Could not isolate car sheet metal cleanly. Point camera directly at the car and try again.');
+  }
+
+  Future<void> _startWalkaroundScan() async {
+    if (_unityController == null || _sharingPhoto || _maskingBusy || _isWalkaroundScanning) return;
+    setState(() {
+      _isWalkaroundScanning = true;
+      _isCapturingWalkaroundAngle = false;
+      _walkaroundStep = 0;
+      _walkaroundSnapPaths.clear();
+      _walkaroundStepPrompt = 'Step 1 of 3: Frame Front 3/4 View and tap Capture';
+      _unityStatus = 'Showroom 360° Director Mode · Step 1/3';
+    });
+  }
+
+  void _cancelWalkaround() {
+    setState(() {
+      _isWalkaroundScanning = false;
+      _isCapturingWalkaroundAngle = false;
+      _walkaroundStep = 0;
+      _walkaroundSnapPaths.clear();
+      _unityStatus = '🟢 Live AR Customizer · 60 FPS';
+    });
+  }
+
+  Future<void> _triggerWalkaroundCapture() async {
+    if (!_isWalkaroundScanning || _isCapturingWalkaroundAngle || _unityController == null) return;
+    setState(() {
+      _isCapturingWalkaroundAngle = true;
+      _unityStatus = 'Capturing ${_walkaroundAngleLabels[_walkaroundStep]}…';
+    });
+    _post(UnityCommands.captureSnapshot(clean: true));
+  }
+
+  void _handleWalkaroundSnapshot(String snapPath) {
+    _walkaroundSnapPaths.add(snapPath);
+    setState(() {
+      _isCapturingWalkaroundAngle = false;
+    });
+
+    if (_walkaroundStep < _walkaroundAngleLabels.length - 1) {
+      setState(() {
+        _walkaroundStep++;
+        _walkaroundStepPrompt =
+            'Step ${_walkaroundStep + 1} of ${_walkaroundAngleLabels.length}: Frame ${_walkaroundAngleLabels[_walkaroundStep]} and tap Capture';
+        _unityStatus = 'Step ${_walkaroundStep + 1}/3 · ${_walkaroundAngleLabels[_walkaroundStep]}';
+      });
+      return;
+    }
+
+    // All angles captured!
+    setState(() {
+      _isWalkaroundScanning = false;
+      _sharingPhoto = true;
+      _unityStatus = 'Polishing 360° Showroom Turntable…';
+    });
+
+    final paths = List<String>.from(_walkaroundSnapPaths);
+    _processWalkaroundSnapshots(paths);
+  }
+
+  Future<void> _processWalkaroundSnapshots(List<String> paths) async {
+    final cuts = <ShowroomAngleCut>[];
+    for (int i = 0; i < paths.length; i++) {
+      final label = i < _walkaroundAngleLabels.length ? _walkaroundAngleLabels[i] : 'Angle ${i + 1}';
+      final cut = await _polishSingleAngle(paths[i], label);
+      if (cut != null) {
+        cuts.add(cut);
+      } else {
+        // Fallback: If polishing on an angle didn't cleanly isolate, keep the raw snapshot so angle isn't dropped
+        try {
+          final file = File(paths[i]);
+          if (await file.exists()) {
+            final rawBytes = await file.readAsBytes();
+            cuts.add(ShowroomAngleCut(label: label, polishedBytes: rawBytes, originalBytes: rawBytes));
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _sharingPhoto = false;
+      _unityStatus = '🟢 Live AR Customizer · 60 FPS';
+    });
+
+    if (cuts.isNotEmpty) {
+      final paintName = _currentPaintDisplayTitle;
+      HdShowroomViewer.show(
+        context,
+        angles: cuts,
+        paintName: paintName,
+        hexColor: _paintState.colorHex,
+        finish: _paintState.finish,
+        vehicleTitle: _displayVehicleTitle,
+      );
+    } else {
+      _snack('Could not isolate vehicle angles cleanly. Please keep car in frame and try again.');
+    }
+  }
+
 
   @override
   void dispose() {
@@ -476,16 +630,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     if (asset.type == 'PAINT') {
       final finish = PaintSpec.finishFrom(asset.materialBundleUrl, asset.name);
       final color = PaintSpec.colorToken(asset.materialBundleUrl, asset.name);
-      setState(() {
-        _selected[asset.type] = asset;
-        _finish = finish;
-        _paintColor = color;
-      });
-      // Instant 0ms tint update on the live moving camera—never pauses to take a photo
-      _sendPaint(color: color, finish: finish, panel: _panel);
-      if (!_sentisLiveActive) {
-        _startLiveFilter();
-      }
+      _updatePaintState(color: color, finish: finish, asset: asset);
       return;
     }
 
@@ -518,14 +663,8 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       return;
     }
     final color = PaintSpec.normalizeHex(raw);
-    setState(() {
-      _paintColor = color;
-      _selected.remove('PAINT');
-    });
-    _sendPaint(color: color, finish: _finish, panel: _panel);
-    if (!_sentisLiveActive) {
-      _startLiveFilter();
-    }
+    _selected.remove('PAINT');
+    _updatePaintState(color: color, assetName: 'Custom $color');
   }
 
   Future<String?> _promptGarageVehicleName() async {
@@ -694,11 +833,16 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     final text = message.toString();
     if (text.startsWith('SNAPSHOT:')) {
       final snapPath = text.substring('SNAPSHOT:'.length);
-      if (_capturingForStudioShare) {
+      if (_isWalkaroundScanning) {
+        _handleWalkaroundSnapshot(snapPath);
+        return;
+      }
+      if (_capturingForStudioShare || _sharingPhoto) {
         _capturingForStudioShare = false;
         _processStudioShareSnapshot(snapPath);
         return;
       }
+
       if (_capturingForMask) {
         _capturingForMask = false;
         _processLiveMaskSnapshot(snapPath);
@@ -741,11 +885,20 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       });
       return;
     }
+    if (text.startsWith('SENTIS_FPS:')) {
+      final parts = text.split(':');
+      final fps = parts.length > 1 ? parts[1] : '60';
+      setState(() {
+        _hasActiveMask = true;
+        _unityStatus = '🟢 On-Device Live AR · $fps FPS';
+      });
+      return;
+    }
     if (text.startsWith('SENTIS_MASK_UPDATED')) {
       if (!_hasActiveMask || (_unityStatus?.contains('Locking') ?? false)) {
         setState(() {
           _hasActiveMask = true;
-          _unityStatus = '🟢 On-Device Live AR · 60 FPS';
+          _unityStatus = '🟢 On-Device Live AR';
         });
       }
       return;
@@ -808,81 +961,49 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                     label: const Text('"Paint Candy Red"'),
                     onPressed: () {
                       Navigator.pop(ctx);
-                      setState(() {
-                        _paintColor = '#D0122D';
-                        _finish = 'candy';
-                      });
-                      _applyCurrentPaint();
+                      _updatePaintState(color: '#D0122D', finish: 'candy');
                     },
                   ),
                   ActionChip(
                     label: const Text('"Paint Super White"'),
                     onPressed: () {
                       Navigator.pop(ctx);
-                      setState(() {
-                        _paintColor = '#F2F3F5';
-                        _finish = 'gloss';
-                      });
-                      _applyCurrentPaint();
+                      _updatePaintState(color: '#F2F3F5', finish: 'gloss');
                     },
                   ),
                   ActionChip(
                     label: const Text('"Paint Matte Black"'),
                     onPressed: () {
                       Navigator.pop(ctx);
-                      setState(() {
-                        _paintColor = '#1C1C1C';
-                        _finish = 'matte';
-                      });
-                      _applyCurrentPaint();
+                      _updatePaintState(color: '#1C1C1C', finish: 'matte');
                     },
                   ),
                   ActionChip(
                     label: const Text('"Gloss Obsidian Black"'),
                     onPressed: () {
                       Navigator.pop(ctx);
-                      setState(() {
-                        _paintColor = '#111111';
-                        _finish = 'gloss';
-                        _panel = 'body';
-                      });
-                      _applyCurrentPaint();
+                      _updatePaintState(color: '#111111', finish: 'gloss', panel: 'body');
                     },
                   ),
                   ActionChip(
                     label: const Text('"Wrap Carbon Hood"'),
                     onPressed: () {
                       Navigator.pop(ctx);
-                      setState(() {
-                        _paintColor = '#111111';
-                        _finish = 'carbon';
-                        _panel = 'hood';
-                      });
-                      _applyCurrentPaint();
+                      _updatePaintState(color: '#111111', finish: 'carbon', panel: 'hood');
                     },
                   ),
                   ActionChip(
                     label: const Text('"Two-Tone Floating Roof"'),
                     onPressed: () {
                       Navigator.pop(ctx);
-                      setState(() {
-                        _paintColor = '#111111';
-                        _finish = 'gloss';
-                        _panel = 'roof';
-                      });
-                      _applyCurrentPaint();
+                      _updatePaintState(color: '#111111', finish: 'gloss', panel: 'roof');
                     },
                   ),
                   ActionChip(
                     label: const Text('"Metallic Silver"'),
                     onPressed: () {
                       Navigator.pop(ctx);
-                      setState(() {
-                        _paintColor = '#B7B7BE';
-                        _finish = 'metallic';
-                        _panel = 'body';
-                      });
-                      _applyCurrentPaint();
+                      _updatePaintState(color: '#B7B7BE', finish: 'metallic', panel: 'body');
                     },
                   ),
                 ],
@@ -1018,7 +1139,66 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                     onUnityMessage: _onUnityMessage,
                   ),
                 ),
+                // Frosted glass loading shimmer during HD Studio capture to conceal intermediate capture / white mask
+                if (_sharingPhoto)
+                  Positioned.fill(
+                    child: ClipRect(
+                      child: BackdropFilter(
+                        filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                        child: Container(
+                          color: Colors.black.withValues(alpha: 0.70),
+                          child: Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(18),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF1E222D).withValues(alpha: 0.95),
+                                    shape: BoxShape.circle,
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color: const Color(0xFF00E5FF).withValues(alpha: 0.4),
+                                        blurRadius: 30,
+                                        spreadRadius: 4,
+                                      ),
+                                    ],
+                                  ),
+                                  child: const CircularProgressIndicator(
+                                    valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF00E5FF)),
+                                    strokeWidth: 3.5,
+                                  ),
+                                ),
+                                const SizedBox(height: 22),
+                                const Text(
+                                  'POLISHING SHOWROOM HD CUT',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    letterSpacing: 2.0,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  _walkaroundSnapPaths.isNotEmpty
+                                      ? 'Meta SAM 2 360° Multi-Angle Turntable Polishing…'
+                                      : 'Meta SAM 2 Sub-Pixel Segmentation & PBR Glaze…',
+                                  style: TextStyle(
+                                    color: Colors.white.withValues(alpha: 0.75),
+                                    fontSize: 12,
+                                  ),
+                                ),
+
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
                 // Top HUD status pill
+
                 if (_unityStatus != null)
                   Positioned(
                     top: 10,
@@ -1072,58 +1252,242 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                       ),
                     ),
                   ),
+                // Walkaround AR Guidance HUD
+                if (_isWalkaroundScanning)
+                  Positioned(
+                    top: 60,
+                    left: 12,
+                    right: 12,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.90),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: const Color(0xFF00E5FF), width: 1.5),
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFF00E5FF).withValues(alpha: 0.35),
+                            blurRadius: 18,
+                            spreadRadius: 2,
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Row(
+                            children: [
+                              const Icon(Icons.rotate_right, color: Color(0xFF00E5FF), size: 20),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  _walkaroundStepPrompt,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                              ),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF00E5FF).withValues(alpha: 0.2),
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Text(
+                                  '${_walkaroundStep + 1}/${_walkaroundAngleLabels.length}',
+                                  style: const TextStyle(
+                                    color: Color(0xFF00E5FF),
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                            children: List.generate(_walkaroundAngleLabels.length, (idx) {
+                              final isDone = idx < _walkaroundStep;
+                              final isCurrent = idx == _walkaroundStep;
+                              final color = isDone
+                                  ? const Color(0xFF00E676)
+                                  : (isCurrent ? const Color(0xFF00E5FF) : Colors.white38);
+                              final icon = isDone
+                                  ? Icons.check_circle
+                                  : (isCurrent ? Icons.camera_alt : Icons.radio_button_unchecked);
+                              return Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: isCurrent
+                                      ? const Color(0xFF00E5FF).withValues(alpha: 0.15)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(
+                                    color: isCurrent ? const Color(0xFF00E5FF) : Colors.transparent,
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(icon, size: 14, color: color),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      _walkaroundAngleLabels[idx].split(' ').first,
+                                      style: TextStyle(
+                                        color: color,
+                                        fontSize: 11,
+                                        fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            }),
+                          ),
+                          const SizedBox(height: 8),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(4),
+                            child: LinearProgressIndicator(
+                              value: (_walkaroundStep + 1) / _walkaroundAngleLabels.length.toDouble(),
+                              backgroundColor: Colors.white12,
+                              valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF00E5FF)),
+                              minHeight: 4,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
                 // Bottom live AR showroom controls
                 Positioned(
                   bottom: 10,
                   left: 12,
                   right: 12,
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF00E5FF),
-                            foregroundColor: Colors.black,
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                            elevation: 4,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
-                            ),
+                  child: _isWalkaroundScanning
+                      ? Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.88),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: const Color(0xFF00E5FF), width: 1.5),
                           ),
-                          onPressed: (_sharingPhoto || _maskingBusy)
-                              ? null
-                              : () => _captureHdStudioCut(),
-                          icon: Icon(
-                            _sharingPhoto ? Icons.hourglass_top : Icons.camera_alt,
-                            size: 20,
-                          ),
-                          label: Text(
-                            _sharingPhoto
-                                ? 'Capturing HD Studio Cut…'
-                                : 'Capture HD Studio Cut',
-                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      IconButton.filled(
-                        style: IconButton.styleFrom(
-                          backgroundColor: Colors.black.withValues(alpha: 0.65),
-                          foregroundColor: const Color(0xFF00E5FF),
-                          side: const BorderSide(color: Colors.white38),
-                          padding: const EdgeInsets.all(12),
-                        ),
-                        tooltip: 'Refresh Live Mask',
-                        onPressed: _maskingBusy ? null : () => _refreshLiveMask(),
-                        icon: _maskingBusy
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: Color(0xFF00E5FF),
+                          child: Row(
+                            children: [
+                              IconButton(
+                                onPressed: _isCapturingWalkaroundAngle ? null : _cancelWalkaround,
+                                tooltip: 'Cancel Walkaround',
+                                icon: const Icon(Icons.close, color: Colors.white70),
+                              ),
+                              const SizedBox(width: 4),
+                              Expanded(
+                                child: ElevatedButton.icon(
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: const Color(0xFF00E5FF),
+                                    foregroundColor: Colors.black,
+                                    padding: const EdgeInsets.symmetric(vertical: 14),
+                                    elevation: 6,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                  ),
+                                  onPressed: _isCapturingWalkaroundAngle ? null : _triggerWalkaroundCapture,
+                                  icon: _isCapturingWalkaroundAngle
+                                      ? const SizedBox(
+                                          width: 18,
+                                          height: 18,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            color: Colors.black,
+                                          ),
+                                        )
+                                      : const Icon(Icons.camera_alt, color: Colors.black, size: 20),
+                                  label: Text(
+                                    _isCapturingWalkaroundAngle
+                                        ? 'Capturing Angle ${_walkaroundStep + 1}…'
+                                        : '📸 Capture Angle (${_walkaroundStep + 1}/${_walkaroundAngleLabels.length})',
+                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                                  ),
                                 ),
-                              )
+                              ),
+                            ],
+                          ),
+                        )
+                      : Row(
+                          children: [
+                            Expanded(
+                              child: ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF00E5FF),
+                                  foregroundColor: Colors.black,
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                  elevation: 4,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                ),
+                                onPressed: (_sharingPhoto || _maskingBusy || _isWalkaroundScanning)
+                                    ? null
+                                    : () => _captureHdStudioCut(),
+                                icon: Icon(
+                                  _sharingPhoto && !_isWalkaroundScanning ? Icons.hourglass_top : Icons.camera_alt,
+                                  size: 18,
+                                ),
+                                label: Text(
+                                  _sharingPhoto && !_isWalkaroundScanning
+                                      ? 'Polishing HD…'
+                                      : 'Instant HD Photo',
+                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF161B22),
+                                  foregroundColor: const Color(0xFF00E5FF),
+                                  side: const BorderSide(color: Color(0xFF00E5FF), width: 1.2),
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                  elevation: 4,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                ),
+                                onPressed: (_sharingPhoto || _maskingBusy || _isWalkaroundScanning)
+                                    ? null
+                                    : () => _startWalkaroundScan(),
+                                icon: Icon(
+                                  _isWalkaroundScanning ? Icons.hourglass_bottom : Icons.rotate_right,
+                                  size: 18,
+                                ),
+                                label: Text(
+                                  _isWalkaroundScanning ? 'Scanning…' : '360° Walkaround',
+                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            IconButton.filled(
+                              style: IconButton.styleFrom(
+                                backgroundColor: Colors.black.withValues(alpha: 0.65),
+                                foregroundColor: const Color(0xFF00E5FF),
+                                side: const BorderSide(color: Colors.white38),
+                                padding: const EdgeInsets.all(12),
+                              ),
+                              tooltip: 'Refresh Live Mask',
+                              onPressed: (_maskingBusy || _isWalkaroundScanning) ? null : () => _refreshLiveMask(),
+                              icon: _maskingBusy
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Color(0xFF00E5FF),
+                                      ),
+                                    )
                             : const Icon(Icons.sync, size: 20),
                       ),
                       if (_lastGoodPolishedBytes != null) ...[
@@ -1178,14 +1542,34 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                             style: TextStyle(fontSize: 12, color: Colors.white70),
                           ),
                           const SizedBox(height: 6),
-                          _choiceRow('Finish', PaintSpec.finishes, _finish, (value) {
-                            setState(() => _finish = value);
-                            _applyCurrentPaint();
+                          _choiceRow('Finish', PaintSpec.finishes, _paintState.finish, (value) {
+                            _updatePaintState(finish: value);
                           }),
-                          _choiceRow('Panel', PaintSpec.panels, _panel, (value) {
-                            setState(() => _panel = value);
-                            _applyCurrentPaint();
+                          _choiceRow('Panel', PaintSpec.panels, _paintState.panel, (value) {
+                            _updatePaintState(panel: value);
                           }),
+                          _choiceRow(
+                            'Coverage Mode',
+                            const ['true-to-life', 'full'],
+                            _coverageMode,
+                            (value) {
+                              setState(() {
+                                _coverageMode = value;
+                              });
+                              _sendPaint(
+                                color: _paintState.colorHex,
+                                finish: _paintState.finish,
+                                panel: _paintState.panel,
+                              );
+                              if (_hasActiveMask && !_maskingBusy) {
+                                _refreshLiveMask();
+                              }
+                            },
+                            labels: const {
+                              'true-to-life': 'True-to-Life (Clean Lights & Plates)',
+                              'full': 'Full Coverage',
+                            },
+                          ),
                           const SizedBox(height: 8),
                           Row(
                             children: [
@@ -1257,7 +1641,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
     );
   }
 
-  Widget _choiceRow(String title, List<String> values, String selected, ValueChanged<String> onPick) {
+  Widget _choiceRow(String title, List<String> values, String selected, ValueChanged<String> onPick, {Map<String, String>? labels}) {
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: Column(
@@ -1270,7 +1654,9 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
             runSpacing: 6,
             children: values.map((value) {
               final on = value == selected;
-              final label = value[0].toUpperCase() + value.substring(1);
+              final label = labels != null && labels.containsKey(value)
+                  ? labels[value]!
+                  : (value[0].toUpperCase() + value.substring(1));
               return ChoiceChip(
                 label: Text(label),
                 selected: on,

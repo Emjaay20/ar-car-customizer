@@ -219,7 +219,7 @@ public class FlutterMessageReceiver : MonoBehaviour
             segmenter.StopLiveLoop();
             var filter = LiveCarFilter.Ensure(Camera.main);
             if (filter != null)
-                filter.SetMask(null);
+                filter.ClearLive();
             SendMessageToFlutter("SENTIS_STOPPED");
             return;
         }
@@ -248,7 +248,7 @@ public class FlutterMessageReceiver : MonoBehaviour
             return;
         }
 
-        filter.SetFinish(finish.metallic, finish.smoothness, finish.strength, request.PanelId());
+        filter.SetFinish(finish.metallic, finish.smoothness, finish.strength, request.PanelId(), request.FinishId());
         if (!liveTintSent)
             SendMessageToFlutter("LIVE_TINT:" + request.finish + ":" + request.color);
         liveTintSent = true;
@@ -599,21 +599,13 @@ public class FlutterMessageReceiver : MonoBehaviour
             yield break;
         }
 
-        // Crop snapshot to Unity AR camera viewport (top ~55% of portrait screen, excluding bottom Flutter drawer)
-        int cropY = (int)(texture.height * 0.44f);
-        int cropH = texture.height - cropY;
-        int cropW = texture.width;
-        var croppedTex = new Texture2D(cropW, cropH, TextureFormat.RGB24, false);
-        var pixels = texture.GetPixels(0, cropY, cropW, cropH);
-        croppedTex.SetPixels(pixels);
-        croppedTex.Apply();
-        var bytes = croppedTex.EncodeToPNG();
-        Destroy(croppedTex);
+        // Capture full uncropped camera frame so vehicle body, bumper, wheels, and hood are completely preserved
+        var bytes = texture.EncodeToJPG(92);
         Destroy(texture);
 
         var path = Path.Combine(
             Application.persistentDataPath,
-            "ar-paint-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss") + ".png");
+            "ar-paint-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss") + ".jpg");
         try
         {
             File.WriteAllBytes(path, bytes);

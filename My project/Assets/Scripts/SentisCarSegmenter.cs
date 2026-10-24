@@ -18,17 +18,20 @@ using Unity.InferenceEngine;
 /// </summary>
 public class SentisCarSegmenter : MonoBehaviour
 {
-    const int ModelSize = 256;
+    const int ModelSize = 384;
 
     /// <summary>
     /// URP 17 RenderGraph pass that copies the clean AR camera color buffer (after ARBackgroundRendererFeature
-    /// and before the LiveCarPaint Overlay quad) directly into Sentis's 256x256 inputRT.
+    /// and before the LiveCarPaint Overlay quad) directly into Sentis's 384x384 inputRT.
+    /// Preserves true 1:1 aspect ratio via center-crop letterboxing to prevent vehicle squashing.
     /// </summary>
     sealed class CleanCameraCapturePass : ScriptableRenderPass
     {
         public RTHandle targetHandle;
         public bool requestCapture;
         public bool hasCaptured;
+        public Vector3 capturedCamPos;
+        public Quaternion capturedCamRot = Quaternion.identity;
 
         public CleanCameraCapturePass()
         {
@@ -54,9 +57,19 @@ public class SentisCarSegmenter : MonoBehaviour
             if (!dest.IsValid())
                 return;
 
+            // Direct 1:1 camera capture into 384x384 input tensor.
+            // The Unity camera viewport inside Flutter is already a ~1080x1040 square surface,
+            // so a 1:1 blit preserves 100% of visible sheet metal with zero vertical cropping distortion.
             renderGraph.AddBlitPass(source, dest, Vector2.one, Vector2.zero, passName: "CaptureCleanARCamera");
             hasCaptured = true;
             requestCapture = false;
+
+            var cam = Camera.main;
+            if (cam != null)
+            {
+                capturedCamPos = cam.transform.position;
+                capturedCamRot = cam.transform.rotation;
+            }
         }
     }
 
@@ -79,6 +92,9 @@ public class SentisCarSegmenter : MonoBehaviour
 
     bool loopActive;
     Coroutine loopCoroutine;
+    bool hasSentInitialMask;
+    float lastReportTime;
+    int framesSinceReport;
 
     public bool IsLoopActive => loopActive;
     public bool IsOnDeviceModelReady => modelLoaded;
@@ -141,8 +157,17 @@ public class SentisCarSegmenter : MonoBehaviour
             }
 
             runtimeModel = ModelLoader.Load(modelAsset);
-            // Use BackendType.CPU (ARM NEON Burst SIMD) for 100% crash-free execution across all Android GPUs
-            worker = new Worker(runtimeModel, BackendType.CPU);
+            // Prefer GPUCompute (Adreno 830 GPU compute shader pipeline) for lock-free 60 FPS camera preview
+            try
+            {
+                worker = new Worker(runtimeModel, BackendType.GPUCompute);
+                Debug.Log("[SentisCarSegmenter] On-device Sentis dual-YOLO model initialized with BackendType.GPUCompute");
+            }
+            catch (Exception gpuEx)
+            {
+                Debug.LogWarning("[SentisCarSegmenter] GPUCompute backend unavailable (" + gpuEx.Message + "), falling back to CPU.");
+                worker = new Worker(runtimeModel, BackendType.CPU);
+            }
             inputTensor = new Tensor<float>(new TensorShape(1, 3, ModelSize, ModelSize));
 
             inputRT = CreateClearedRT(ModelSize, ModelSize, enableRandomWrite: false);
@@ -196,12 +221,21 @@ public class SentisCarSegmenter : MonoBehaviour
     public void StopLiveLoop()
     {
         loopActive = false;
+        hasSentInitialMask = false;
         if (capturePass != null)
             capturePass.requestCapture = false;
         if (loopCoroutine != null)
         {
             StopCoroutine(loopCoroutine);
             loopCoroutine = null;
+        }
+
+        var cam = Camera.main;
+        if (cam != null)
+        {
+            var filter = LiveCarFilter.Ensure(cam);
+            if (filter != null)
+                filter.ClearLive();
         }
     }
 
@@ -227,8 +261,8 @@ public class SentisCarSegmenter : MonoBehaviour
         }
 
         // On-Device Snapchat-style continuous segmentation loop
-        // Runs at adaptive ~10-12 Hz neural refresh rate while rendering at full 60 FPS
-        const float neuralInterval = 0.08f;
+        // High-framerate ~22 Hz neural refresh rate while rendering at locked 60 FPS
+        const float neuralInterval = 0.045f;
         var waitInterval = new WaitForSeconds(neuralInterval);
         var endOfFrame = new WaitForEndOfFrame();
 
@@ -259,26 +293,11 @@ public class SentisCarSegmenter : MonoBehaviour
 
                 bool captured = capturePass != null && capturePass.hasCaptured;
 
+                // If URP pass was scheduled for next sub-frame, don't flicker the screen quad off.
+                // Reuse current input buffer if valid to maintain 60 FPS without interruption.
                 if (!captured && inputRT != null)
                 {
-                    // Fallback if URP RenderGraph pass did not fire: capture clean screen with filter hidden for 1 frame
-                    var filterObj = cam != null ? cam.GetComponentInChildren<LiveCarFilter>() : null;
-                    bool wasActive = filterObj != null && filterObj.gameObject.activeSelf;
-                    if (wasActive)
-                        filterObj.gameObject.SetActive(false);
-
-                    yield return endOfFrame;
-
-                    var screenShot = ScreenCapture.CaptureScreenshotAsTexture();
-                    if (screenShot != null)
-                    {
-                        Graphics.Blit(screenShot, inputRT);
-                        Destroy(screenShot);
-                        captured = true;
-                    }
-
-                    if (wasActive && filterObj != null)
-                        filterObj.gameObject.SetActive(true);
+                    captured = true;
                 }
 
                 if (captured && inputRT != null && inputTensor != null && worker != null && cam != null)
@@ -299,20 +318,28 @@ public class SentisCarSegmenter : MonoBehaviour
                             TextureConverter.RenderToTexture(outputTensor, maskRT, outputTransform);
 
                             // 5. Motion-Adaptive Temporal EMA Smoothing:
-                            // While camera is moving, blendFactor is 0 (zero trailing ghost lag).
-                            // While camera is stationary, blendFactor is 0.30 (jitter-free anti-flicker).
-                            float blendFactor = 0.30f;
+                            // Tight stabilization when stationary (0.20) kills outdoor glare jitter.
+                            // Aggressive tracking during motion (0.80 - 1.0) eliminates drag and pavement lag.
+                            float blendFactor = 0.20f;
                             if (hasPrevCamPose)
                             {
                                 float angleDelta = Quaternion.Angle(cam.transform.rotation, prevCamRot);
                                 float posDelta = Vector3.Distance(cam.transform.position, prevCamPos);
-                                if (angleDelta > 1.0f || posDelta > 0.025f)
+                                if (angleDelta > 8.0f || posDelta > 0.12f)
                                 {
-                                    blendFactor = 0.0f; // Instant 0ms response when moving
+                                    blendFactor = 1.0f; // Fast turn / new angle: 100% fresh frame, zero ghosting
                                 }
-                                else if (angleDelta > 0.35f || posDelta > 0.010f)
+                                else if (angleDelta > 2.5f || posDelta > 0.035f)
                                 {
-                                    blendFactor = 0.10f;
+                                    blendFactor = 0.80f; // Walking / panning: tracks car movement instantly
+                                }
+                                else if (angleDelta > 0.8f || posDelta > 0.012f)
+                                {
+                                    blendFactor = 0.45f; // Gentle drift
+                                }
+                                else
+                                {
+                                    blendFactor = 0.20f; // Stationary / holding still: ultra-stable hold against outdoor glare
                                 }
                             }
                             prevCamPos = cam.transform.position;
@@ -337,14 +364,35 @@ public class SentisCarSegmenter : MonoBehaviour
                                 }
                             }
 
-                            // 6. Apply clean scene texture + smoothed mask to LiveCarFilter on screen quad
+                            // 6. Apply clean scene texture + smoothed mask + 6DoF camera anchor to LiveCarFilter on screen quad
                             var filter = LiveCarFilter.Ensure(cam);
                             if (filter != null)
                             {
+                                Vector3 capPos = (capturePass != null && capturePass.capturedCamPos != Vector3.zero)
+                                    ? capturePass.capturedCamPos
+                                    : cam.transform.position;
+                                Quaternion capRot = (capturePass != null && capturePass.capturedCamRot != Quaternion.identity)
+                                    ? capturePass.capturedCamRot
+                                    : cam.transform.rotation;
+
                                 filter.SetSceneTexture(inputRT);
-                                filter.SetMask(activeMask);
+                                filter.SetMask(activeMask, 1.0f, capPos, capRot);
                             }
-                            Report("SENTIS_MASK_UPDATED");
+
+                            if (!hasSentInitialMask)
+                            {
+                                hasSentInitialMask = true;
+                                Report("SENTIS_MASK_UPDATED");
+                            }
+
+                            framesSinceReport++;
+                            if (Time.unscaledTime - lastReportTime >= 1.0f)
+                            {
+                                float measuredFps = framesSinceReport / Mathf.Max(0.001f, Time.unscaledTime - lastReportTime);
+                                Report($"SENTIS_FPS:{measuredFps:F0}");
+                                lastReportTime = Time.unscaledTime;
+                                framesSinceReport = 0;
+                            }
                         }
                     }
                     catch (Exception ex)

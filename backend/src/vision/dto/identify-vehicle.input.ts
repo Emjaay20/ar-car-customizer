@@ -25,4 +25,7 @@ export class IdentifyVehicleInput {
 
   @Field({ nullable: true })
   hdMode?: boolean;
+
+  @Field({ nullable: true })
+  fullCoverage?: boolean;
 }

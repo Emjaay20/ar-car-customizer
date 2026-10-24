@@ -55,7 +55,12 @@ Shader "ARCar/TemporalBlend"
             {
                 float4 current = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, input.uv);
                 float4 prev = SAMPLE_TEXTURE2D(_PrevTex, sampler_PrevTex, input.uv);
-                return lerp(prev, current, _Blend);
+                // Anti-spill rule: prev history stabilizes glare/noise INSIDE the current vehicle mask.
+                // If current frame is empty (< 0.10), prev history is gated out to zero immediately,
+                // eliminating ghost trails on the ground/pavers during phone movement.
+                float historyValid = smoothstep(0.08, 0.28, current.r);
+                float4 gatedPrev = prev * historyValid;
+                return lerp(gatedPrev, current, _Blend);
             }
             ENDHLSL
         }
@@ -103,7 +108,9 @@ Shader "ARCar/TemporalBlend"
             {
                 fixed4 current = tex2D(_MainTex, input.uv);
                 fixed4 prev = tex2D(_PrevTex, input.uv);
-                return lerp(prev, current, _Blend);
+                float historyValid = smoothstep(0.08, 0.28, current.r);
+                fixed4 gatedPrev = prev * historyValid;
+                return lerp(gatedPrev, current, _Blend);
             }
             ENDCG
         }
