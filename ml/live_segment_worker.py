@@ -380,6 +380,12 @@ def build_paint_mask(
                 # 1. Body Panel Union: add detected trunk, hood, doors, roof, bumpers, fenders to solid
                 if part_name in PAINTABLE_BODY_PARTS and conf >= 0.10:
                     body_panels_union = cv2.bitwise_or(body_panels_union, m_u8)
+                elif 'mirror' in part_name and conf >= 0.10:
+                    # Paint the outer mirror cap while excluding dark reflective mirror glass
+                    mirror_cap = (m_u8 > 0) & (gray_u8 >= 72)
+                    mirror_glass = (m_u8 > 0) & (gray_u8 < 72)
+                    body_panels_union = cv2.bitwise_or(body_panels_union, mirror_cap.astype(np.uint8) * 255)
+                    cutout = cv2.bitwise_or(cutout, mirror_glass.astype(np.uint8) * 255)
 
                 # 2. Exclude non-paint regions:
                 if full_coverage:
@@ -393,18 +399,36 @@ def build_paint_mask(
                         cutout = cv2.bitwise_or(cutout, wheel_tight.astype(np.uint8) * 255)
                 else:
                     # True-to-Life (default): keep lights, windows, wheels, plate clean; paint grille
-                    if part_name in NON_PAINT_PARTS and part_name != 'license-plate' and part_name != 'grille':
+                    if part_name in NON_PAINT_PARTS and part_name != 'license-plate':
                         if 'window' in part_name or 'windshield' in part_name:
                             win_f = (m_u8 > 120).astype(np.float32)
                             win_snapped = guided_filter_mask(gray, win_f, radius=3, eps=1e-3)
                             win_u8 = (win_snapped > 0.40).astype(np.uint8) * 255
-                            # Protect bright white C-pillar and roof metal from being classified as window glass
-                            win_u8[gray_u8 > 210] = 0
+                            # Pull bloated window mask border off adjacent bright white sheet metal (sills, C-pillar, roof)
+                            k_win_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                            win_core = cv2.erode(win_u8, k_win_erode, iterations=1)
+                            win_u8[(gray_u8 > 175) & (win_core == 0)] = 0
+                            # Seal adjacent matte-black B-pillar and black rubber window molding into the cabin cutout
+                            k_b_pillar = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
+                            win_zone = cv2.dilate(win_u8, k_b_pillar, iterations=1)
+                            b_pillar_trim = (win_zone > 0) & (gray_u8 < 72) & (solid > 0)
+                            win_u8[b_pillar_trim] = 255
                             cutout = cv2.bitwise_or(cutout, win_u8)
                         elif 'wheel' in part_name:
-                            wheel_tight = (m_u8 > 0) & ((gray_u8 < 95) | (m_u8 > 210))
+                            # Pull wheel mask border off bright white painted fender arch lips (gray_u8 > 168)
+                            k_whl_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+                            whl_core = cv2.erode(m_u8, k_whl_erode, iterations=1)
+                            wheel_tight = (m_u8 > 0) & ((gray_u8 < 168) | (whl_core > 0))
                             cutout = cv2.bitwise_or(cutout, wheel_tight.astype(np.uint8) * 255)
+                        elif 'grille' in part_name:
+                            # Grille cutout applies strictly to dark honeycomb mesh (gray_u8 < 135), never white bumper bridge
+                            grille_tight = (m_u8 > 0) & (gray_u8 < 135)
+                            cutout = cv2.bitwise_or(cutout, grille_tight.astype(np.uint8) * 255)
                         else:
+                            if 'headlight' in part_name or 'tail-light' in part_name:
+                                k_lamp_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                                lamp_core = cv2.erode(m_u8, k_lamp_erode, iterations=1)
+                                m_u8[(gray_u8 > 185) & (lamp_core == 0)] = 0
                             cutout = cv2.bitwise_or(cutout, m_u8)
 
                 if part_name == 'license-plate' and conf >= 0.35:
@@ -501,6 +525,13 @@ def build_paint_mask(
     # Do NOT zero sharp_alpha[license_plate] - bumper sheet metal stays smooth and continuous
 
     final_mask = np.clip(sharp_alpha * 255.0, 0, 255).astype(np.uint8)
+    # Close the 1-2px white rim the guided shrink leaves on a white car,
+    # without growing past the silhouette or back into lights and glass.
+    rim_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    grown = cv2.dilate(final_mask, rim_k, iterations=1)
+    grown = cv2.bitwise_and(grown, solid)
+    grown[cutout > 0] = 0
+    final_mask = grown
     if return_plate:
         return final_mask, license_plate
     return final_mask
@@ -731,18 +762,30 @@ def studio_polish_car_paint(
     if not np.any(car_region):
         return base_bgr
 
-    # 1. Bilateral decomposition: separate smooth geometry from sharp creases/panel lines
+    # 1. Multi-Scale Intrinsic & HDR Reflection Decomposition
     smooth_luma = cv2.bilateralFilter(gray, 9, 0.08, 9.0)
-    # Threshold crease so dirty spots and surface scratches do not darken the paint
-    crease = np.clip((smooth_luma - gray - 0.06) * 4.0, 0.0, 1.0)
-    # Ambient Occlusion: shutlines and deep creases drop at most to 0.68, flat metal stays 1.0
-    ao = np.clip(1.0 - 0.32 * crease, 0.68, 1.0)[:, :, None]
+    broad_luma = cv2.GaussianBlur(gray, (11, 11), 2.5)
+    macro_k = max(45, int(round(min(h, w) * 0.08)) | 1)
+    macro_luma = cv2.GaussianBlur(gray, (macro_k, macro_k), 0)
 
-    # 2. Intrinsic car-normalized illumination (Retinex)
-    vals = smooth_luma[car_region]
+    # Crevice-only detail ratio: keeps panel shutlines, door handles, and bumper seams razor-sharp (< 1.0)
+    # without boosting bright edges next to dark panel gaps into false white lines
+    detail_ratio = np.clip((gray + 0.03) / (broad_luma + 0.03), 0.58, 1.01)
+    crease = np.clip((smooth_luma - gray - 0.04) * 4.5, 0.0, 1.0)
+    ao = (np.clip(1.0 - 0.35 * crease, 0.62, 1.0) * detail_ratio)[:, :, None]
+
+    # 2. Macro 3D Body Curvature Illumination (preserves 3D volume while keeping HDR sky reflections separate)
+    vals = macro_luma[car_region]
     p5 = float(np.percentile(vals, 4))
     p95 = float(np.percentile(vals, 96))
-    norm_shade = np.clip((smooth_luma - p5) / max(p95 - p5, 0.12), 0.0, 1.0)
+    norm_shade = np.clip((macro_luma - p5) / max(p95 - p5, 0.14), 0.0, 1.0)
+
+    # Seam-free HDR Clearcoat Reflection Layer (captures sky, clouds, trees & horizon reflections without white-paint wash)
+    min_neighbor_luma = cv2.erode(gray, np.ones((7, 7), np.float32))
+    seam_free = np.clip((min_neighbor_luma - 0.48) / 0.18, 0.0, 1.0)
+    hdr_env_reflect = np.clip((broad_luma - macro_luma - 0.006) / 0.085, 0.0, 1.0) * seam_free
+    hdr_reflection = hdr_env_reflect[:, :, None]
+    hdr_sun_glint = ((np.clip((gray - 0.78) / 0.20, 0.0, 1.0) ** 5.0) * seam_free)[:, :, None]
 
     # 3. 3D Outer Silhouette Distance for Fresnel (strictly outer perimeter, NOT internal cutouts!)
     if solid_silhouette is not None and np.any(solid_silhouette > 0):
@@ -818,18 +861,16 @@ def studio_polish_car_paint(
             norm_shade = np.clip((smooth_luma - p5) / max(p95 - p5, 0.15), 0.0, 1.0)
             if target_luma < 0.12:
                 # Realistic 3D Automotive Matte Black (e.g. 3M 2080 Deep Matte Black)
-                # Map base pigment across [0.040, 0.155] so door handles, seams and creases stay crisp
-                body_luma = 0.040 + 0.115 * norm_shade
-                base_matte = np.stack([body_luma, body_luma, body_luma + 0.004], axis=-1)
-                # Broad diffuse velvet sheen (soft-light sky wrap, roughness ~0.82)
-                velvet_sheen = 0.032 * (np.clip((smooth_luma - 0.35) / 0.65, 0.0, 1.0) ** 2.0)[:, :, None]
+                body_luma = 0.028 + 0.068 * norm_shade
+                base_matte = np.stack([body_luma, body_luma, body_luma + 0.003], axis=-1)
+                velvet_sheen = 0.016 * (np.clip((smooth_luma - 0.35) / 0.65, 0.0, 1.0) ** 2.0)[:, :, None]
                 effective_albedo = base_matte + velvet_sheen
             else:
                 effective_albedo = target_bgr[None, None, :] * np.clip(0.65 + 0.35 * norm_shade, 0.60, 1.08)[:, :, None]
         else:
             if target_luma < 0.12:
-                # Showroom Gloss Obsidian Black: base pigment with deep reflection
-                body_luma = 0.025 + 0.095 * norm_shade
+                # Showroom Inozetek Super Gloss Piano Black: deep jet-black base pigment
+                body_luma = 0.012 + 0.052 * (norm_shade ** 1.35)
                 effective_albedo = np.stack([body_luma, body_luma, body_luma + 0.003], axis=-1)
             else:
                 # Gloss / Satin / Metallic Neutral (Silver, Grey, White):
@@ -861,27 +902,38 @@ def studio_polish_car_paint(
     # Diffuse Basecoat: 100% opaque pigment illumination modulated by AO
     diffuse_layer = effective_albedo * ao
 
-    # Clearcoat Specular + Fresnel Reflection Layer:
-    # Matte finish has zero clearcoat glint and zero sky sheen
+    # Clearcoat HDR Specular + Fresnel Reflection Layer:
+    # Matte finish (3M 2080 Matte Stealth) has zero clearcoat glint and zero sky reflection
     if finish == "matte":
         specular_layer = np.zeros_like(diffuse_layer)
-    else:
-        direct_glint = (np.clip((norm_shade - 0.68) / 0.32, 0.0, 1.0) ** (spec_power / 14.0))[:, :, None]
+    elif finish == "satin":
         fresnel_sheen = (clearcoat_f0 + (clearcoat_grazing - clearcoat_f0) * grazing)[:, :, None]
-        clearcoat_color = np.array([1.0, 0.98, 0.96], dtype=np.float32)
-        specular_layer = clearcoat_color[None, None, :] * (direct_glint * 0.50 + fresnel_sheen * 0.20)
+        satin_crown = (np.power(norm_shade, 2.2) * 0.12)[:, :, None]
+        clearcoat_color = np.array([1.0, 0.99, 0.97], dtype=np.float32)[None, None, :]
+        specular_layer = clearcoat_color * (satin_crown + hdr_reflection * 0.18 + hdr_sun_glint * 0.22 + fresnel_sheen * 0.14)
+    elif finish == "candy":
+        fresnel_sheen = (clearcoat_f0 + (clearcoat_grazing - clearcoat_f0) * grazing)[:, :, None]
+        clearcoat_color = np.array([1.0, 0.98, 0.96], dtype=np.float32)[None, None, :]
+        specular_layer = (
+            clearcoat_color * (hdr_reflection * 0.44 + hdr_sun_glint * 0.65 + fresnel_sheen * 0.22)
+            + target_bgr[None, None, :] * hdr_reflection * 0.22
+        )
+    else:
+        # Inozetek Super Gloss & Metallic Showroom Clearcoat
+        fresnel_sheen = (clearcoat_f0 + (clearcoat_grazing - clearcoat_f0) * grazing)[:, :, None]
+        clearcoat_color = np.array([1.0, 0.99, 0.97], dtype=np.float32)[None, None, :]
+        spec_boost = 0.44 if target_luma < 0.15 else 0.36
+        specular_layer = clearcoat_color * (hdr_reflection * spec_boost + hdr_sun_glint * 0.58 + fresnel_sheen * 0.18)
 
     if finish == "metallic":
         flake = (np.abs(smooth_luma - gray) * 3.5)[:, :, None]
         diffuse_layer = diffuse_layer * (1.0 + np.clip(flake, 0.0, 0.30))
 
-    painted_bgr = np.clip(diffuse_layer + specular_layer, 0.0, 1.0)
+    # ACES-inspired HDR highlight compression so bright clearcoat reflections roll off smoothly
+    raw_hdr = diffuse_layer + specular_layer
+    painted_bgr = np.clip(raw_hdr / (1.0 + 0.18 * np.maximum(0.0, raw_hdr - 0.82)), 0.0, 1.0)
 
-    # Chrome badge and rubber trim edge protection:
-    trim_edge = np.clip((np.abs(smooth_luma - gray) - 0.16) * 5.0, 0.0, 1.0)
-    alpha = alpha * (1.0 - 0.70 * trim_edge)
-
-    # Composite: mask alpha anti-aliasing strictly at the edge, solid 100% inside
+    # Composite: mask alpha anti-aliasing strictly at the outer perimeter, 100% opaque inside sheet metal
     a3 = alpha[:, :, None]
     comp = (1.0 - a3) * img_f + a3 * painted_bgr
     comp_u8 = np.clip(comp * 255.0, 0, 255).astype(np.uint8)

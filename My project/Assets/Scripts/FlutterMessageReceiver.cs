@@ -210,6 +210,21 @@ public class FlutterMessageReceiver : MonoBehaviour
 
     public void RunSentis(string mode)
     {
+        if (string.Equals(mode, "debug_mask_on", StringComparison.OrdinalIgnoreCase))
+        {
+            var filter = LiveCarFilter.Ensure(Camera.main);
+            if (filter != null) filter.SetDebugMaskMode(true);
+            SendMessageToFlutter("DEBUG_MASK:ON");
+            return;
+        }
+        if (string.Equals(mode, "debug_mask_off", StringComparison.OrdinalIgnoreCase))
+        {
+            var filter = LiveCarFilter.Ensure(Camera.main);
+            if (filter != null) filter.SetDebugMaskMode(false);
+            SendMessageToFlutter("DEBUG_MASK:OFF");
+            return;
+        }
+
         var segmenter = GetComponent<SentisCarSegmenter>();
         if (segmenter == null)
             segmenter = gameObject.AddComponent<SentisCarSegmenter>();
@@ -583,15 +598,18 @@ public class FlutterMessageReceiver : MonoBehaviour
     {
         bool captureClean = string.Equals(mode, "clean", StringComparison.OrdinalIgnoreCase);
         var filter = captureClean ? LiveCarFilter.Ensure(Camera.main) : null;
-        bool wasFilterActive = filter != null && filter.gameObject.activeSelf;
-        if (wasFilterActive)
-            filter.gameObject.SetActive(false);
+        if (filter != null)
+        {
+            filter.SetCaptureCleanHide(true);
+            // Wait one full rendered camera frame so the live paint overlay is guaranteed off-screen
+            yield return null;
+        }
 
         yield return new WaitForEndOfFrame();
         var texture = ScreenCapture.CaptureScreenshotAsTexture();
 
-        if (wasFilterActive && filter != null)
-            filter.gameObject.SetActive(true);
+        if (filter != null)
+            filter.SetCaptureCleanHide(false);
 
         if (texture == null)
         {

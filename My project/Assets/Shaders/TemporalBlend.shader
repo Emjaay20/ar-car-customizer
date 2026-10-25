@@ -60,7 +60,11 @@ Shader "ARCar/TemporalBlend"
                 // eliminating ghost trails on the ground/pavers during phone movement.
                 float historyValid = smoothstep(0.08, 0.28, current.r);
                 float4 gatedPrev = prev * historyValid;
-                return lerp(gatedPrev, current, _Blend);
+                // Motion-step gate: when painted metal (1.0) moves over a previous cutout (0.0),
+                // snap immediately (0.88) so old wheel/window cutouts never punch white holes in the body.
+                float diff = abs(current.r - gatedPrev.r);
+                float adaptiveBlend = lerp(_Blend, max(_Blend, 0.88), smoothstep(0.25, 0.55, diff));
+                return lerp(gatedPrev, current, adaptiveBlend);
             }
             ENDHLSL
         }
@@ -110,7 +114,9 @@ Shader "ARCar/TemporalBlend"
                 fixed4 prev = tex2D(_PrevTex, input.uv);
                 float historyValid = smoothstep(0.08, 0.28, current.r);
                 fixed4 gatedPrev = prev * historyValid;
-                return lerp(gatedPrev, current, _Blend);
+                float diff = abs(current.r - gatedPrev.r);
+                float adaptiveBlend = lerp(_Blend, max(_Blend, 0.88), smoothstep(0.25, 0.55, diff));
+                return lerp(gatedPrev, current, adaptiveBlend);
             }
             ENDCG
         }

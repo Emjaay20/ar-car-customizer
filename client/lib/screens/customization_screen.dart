@@ -140,6 +140,7 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   }
 
   bool _isWalkaroundScanning = false;
+  bool _debugMaskView = false;
   bool _isCapturingWalkaroundAngle = false;
   int _walkaroundStep = 0;
   String _walkaroundStepPrompt = '';
@@ -1245,6 +1246,35 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
                                 style: const TextStyle(fontSize: 12, color: Colors.white),
                                 maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            GestureDetector(
+                              onTap: () {
+                                setState(() {
+                                  _debugMaskView = !_debugMaskView;
+                                });
+                                _post(UnityCommands.setDebugMask(_debugMaskView));
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: _debugMaskView
+                                      ? const Color(0xFF00E676).withValues(alpha: 0.25)
+                                      : Colors.white.withValues(alpha: 0.12),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: _debugMaskView ? const Color(0xFF00E676) : Colors.white30,
+                                  ),
+                                ),
+                                child: Text(
+                                  _debugMaskView ? '🎭 Mask ON' : '🎭 Mask',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: _debugMaskView ? const Color(0xFF00E676) : Colors.white70,
+                                  ),
+                                ),
                               ),
                             ),
                           ],

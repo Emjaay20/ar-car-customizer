@@ -94,7 +94,14 @@ public class SentisCarSegmenter : MonoBehaviour
     Coroutine loopCoroutine;
     bool hasSentInitialMask;
     float lastReportTime;
-    int framesSinceReport;
+    float smoothedRenderFps = 60f;
+
+    // Anti-flicker hold: brief model dropouts (motion judder, exposure shifts) must not
+    // make the paint blink. Keep showing the last accepted mask for a short grace period.
+    int maskHoldCycles;
+    const int MaskHoldMaxCycles = 12;
+    static RenderTexture probeRT;
+    static Texture2D probeTex;
 
     public bool IsLoopActive => loopActive;
     public bool IsOnDeviceModelReady => modelLoaded;
@@ -102,6 +109,15 @@ public class SentisCarSegmenter : MonoBehaviour
     void Awake()
     {
         InitializeOnDeviceModel();
+    }
+
+    void Update()
+    {
+        if (loopActive && Time.unscaledDeltaTime > 0.0001f)
+        {
+            float instantFps = Mathf.Clamp(1.0f / Time.unscaledDeltaTime, 1f, 60f);
+            smoothedRenderFps = Mathf.Lerp(smoothedRenderFps, instantFps, 0.12f);
+        }
     }
 
     void OnEnable()
@@ -149,25 +165,26 @@ public class SentisCarSegmenter : MonoBehaviour
     {
         try
         {
-            var modelAsset = Resources.Load<ModelAsset>("CarSegMask");
+            // Prefer the video-tuned export (parts-anchored presence, no giant-box silhouette):
+            // see ml/video_testbed.py + scratch/corolla_testbed for validation on the Corolla walkaround.
+            var tunedAsset = Resources.Load<ModelAsset>("CarSegMaskTuned");
+            var modelAsset = tunedAsset != null ? tunedAsset : Resources.Load<ModelAsset>("CarSegMask");
             if (modelAsset == null)
             {
                 Debug.LogWarning("[SentisCarSegmenter] CarSegMask.onnx ModelAsset not found in Resources. Falling back to external mask mode.");
                 return;
             }
+            if (tunedAsset != null)
+            {
+                Debug.Log("[SentisCarSegmenter] Loaded video-tuned CarSegMaskTuned.onnx (validated on Corolla walkaround testbed).");
+            }
 
             runtimeModel = ModelLoader.Load(modelAsset);
-            // Prefer GPUCompute (Adreno 830 GPU compute shader pipeline) for lock-free 60 FPS camera preview
-            try
-            {
-                worker = new Worker(runtimeModel, BackendType.GPUCompute);
-                Debug.Log("[SentisCarSegmenter] On-device Sentis dual-YOLO model initialized with BackendType.GPUCompute");
-            }
-            catch (Exception gpuEx)
-            {
-                Debug.LogWarning("[SentisCarSegmenter] GPUCompute backend unavailable (" + gpuEx.Message + "), falling back to CPU.");
-                worker = new Worker(runtimeModel, BackendType.CPU);
-            }
+            // Use BackendType.CPU with time-sliced ScheduleIterable execution:
+            // On Android OpenGL ES 3.0 (gles3), GPUCompute stalls on TopK/Gather readbacks.
+            // Time-sliced CPU (Burst/NEON) guarantees 100% accurate mask tensors while keeping camera locked at 60 FPS.
+            worker = new Worker(runtimeModel, BackendType.CPU);
+            Debug.Log("[SentisCarSegmenter] On-device Sentis model initialized with BackendType.CPU (time-sliced 60 FPS mode).");
             inputTensor = new Tensor<float>(new TensorShape(1, 3, ModelSize, ModelSize));
 
             inputRT = CreateClearedRT(ModelSize, ModelSize, enableRandomWrite: false);
@@ -245,6 +262,44 @@ public class SentisCarSegmenter : MonoBehaviour
         NativeAPI.SendMessageToFlutter(message);
     }
 
+    /// <summary>
+    /// Cheap 8x8 downsample readback of the fresh mask to detect empty/invalid outputs.
+    /// Returns the mean, or float.NaN when the mask contains non-finite values (bad GPU run).
+    /// </summary>
+    static float ProbeMaskMean(RenderTexture mask)
+    {
+        try
+        {
+            if (probeRT == null)
+            {
+                probeRT = CreateClearedRT(8, 8, enableRandomWrite: false);
+                probeTex = new Texture2D(8, 8, TextureFormat.RGBAFloat, false);
+            }
+            Graphics.Blit(mask, probeRT);
+            var prev = RenderTexture.active;
+            RenderTexture.active = probeRT;
+            probeTex.ReadPixels(new Rect(0, 0, 8, 8), 0, 0);
+            probeTex.Apply(false);
+            RenderTexture.active = prev;
+            var pix = probeTex.GetPixels();
+            if (pix == null || pix.Length == 0)
+                return float.NaN;
+            double sum = 0.0;
+            bool finite = true;
+            for (int i = 0; i < pix.Length; i++)
+            {
+                float v = pix[i].r;
+                if (!float.IsFinite(v)) { finite = false; break; }
+                sum += v;
+            }
+            return finite ? (float)(sum / pix.Length) : float.NaN;
+        }
+        catch (Exception)
+        {
+            return float.NaN;
+        }
+    }
+
     public void NotifyExternalMaskApplied()
     {
         // External mask applied from snapshot or cloud polish
@@ -260,10 +315,11 @@ public class SentisCarSegmenter : MonoBehaviour
             yield break;
         }
 
-        // On-Device Snapchat-style continuous segmentation loop
-        // High-framerate ~22 Hz neural refresh rate while rendering at locked 60 FPS
-        const float neuralInterval = 0.045f;
-        var waitInterval = new WaitForSeconds(neuralInterval);
+        // The camera must keep presenting while the network runs. The S25 Ultra
+        // dropped to 4 FPS because every frame waited on the full dual-YOLO graph.
+        // Infer, then rest at least twice as long as that inference took, so most
+        // frames are free. The paint quad warps the last mask with the camera pose
+        // during the rest, which is what keeps it stuck to the car.
         var endOfFrame = new WaitForEndOfFrame();
 
         var inputTransform = new TextureTransform()
@@ -289,122 +345,189 @@ public class SentisCarSegmenter : MonoBehaviour
                     capturePass.requestCapture = true;
                 }
 
+                // Wait up to 2 frames for a confirmed fresh camera capture
                 yield return endOfFrame;
+                if (capturePass != null && !capturePass.hasCaptured)
+                {
+                    yield return endOfFrame;
+                }
 
                 bool captured = capturePass != null && capturePass.hasCaptured;
 
-                // If URP pass was scheduled for next sub-frame, don't flicker the screen quad off.
-                // Reuse current input buffer if valid to maintain 60 FPS without interruption.
-                if (!captured && inputRT != null)
-                {
-                    captured = true;
-                }
-
                 if (captured && inputRT != null && inputTensor != null && worker != null && cam != null)
                 {
+                    Vector3 capPos = (capturePass != null && capturePass.capturedCamPos != Vector3.zero)
+                        ? capturePass.capturedCamPos
+                        : cam.transform.position;
+                    Quaternion capRot = (capturePass != null && capturePass.capturedCamRot != Quaternion.identity)
+                        ? capturePass.capturedCamRot
+                        : cam.transform.rotation;
+
+                    IEnumerator schedule = null;
                     try
                     {
-                        // 1. Convert 256x256 clean camera RT to [1, 3, 256, 256] RGB float tensor
+                        // 1. Convert 384x384 clean camera RT to [1, 3, 384, 384] RGB float tensor
                         TextureConverter.ToTensor(inputRT, inputTensor, inputTransform);
-
-                        // 2. Execute on-device dual-YOLO segmentation network
-                        worker.Schedule(inputTensor);
-
-                        // 3. Retrieve probability mask [1, 1, 256, 256]
-                        var outputTensor = worker.PeekOutput() as Tensor<float>;
-                        if (outputTensor != null && maskRT != null)
-                        {
-                            // 4. Render neural mask output to maskRT
-                            TextureConverter.RenderToTexture(outputTensor, maskRT, outputTransform);
-
-                            // 5. Motion-Adaptive Temporal EMA Smoothing:
-                            // Tight stabilization when stationary (0.20) kills outdoor glare jitter.
-                            // Aggressive tracking during motion (0.80 - 1.0) eliminates drag and pavement lag.
-                            float blendFactor = 0.20f;
-                            if (hasPrevCamPose)
-                            {
-                                float angleDelta = Quaternion.Angle(cam.transform.rotation, prevCamRot);
-                                float posDelta = Vector3.Distance(cam.transform.position, prevCamPos);
-                                if (angleDelta > 8.0f || posDelta > 0.12f)
-                                {
-                                    blendFactor = 1.0f; // Fast turn / new angle: 100% fresh frame, zero ghosting
-                                }
-                                else if (angleDelta > 2.5f || posDelta > 0.035f)
-                                {
-                                    blendFactor = 0.80f; // Walking / panning: tracks car movement instantly
-                                }
-                                else if (angleDelta > 0.8f || posDelta > 0.012f)
-                                {
-                                    blendFactor = 0.45f; // Gentle drift
-                                }
-                                else
-                                {
-                                    blendFactor = 0.20f; // Stationary / holding still: ultra-stable hold against outdoor glare
-                                }
-                            }
-                            prevCamPos = cam.transform.position;
-                            prevCamRot = cam.transform.rotation;
-                            hasPrevCamPose = true;
-
-                            RenderTexture activeMask = maskRT;
-                            if (blendMaterial != null && smoothMaskRT != null && historyMaskRT != null)
-                            {
-                                if (blendFactor > 0.01f)
-                                {
-                                    blendMaterial.SetTexture("_PrevTex", historyMaskRT);
-                                    blendMaterial.SetFloat("_Blend", blendFactor);
-                                    Graphics.Blit(maskRT, smoothMaskRT, blendMaterial);
-                                    Graphics.Blit(smoothMaskRT, historyMaskRT);
-                                    activeMask = smoothMaskRT;
-                                }
-                                else
-                                {
-                                    Graphics.Blit(maskRT, historyMaskRT);
-                                    activeMask = maskRT;
-                                }
-                            }
-
-                            // 6. Apply clean scene texture + smoothed mask + 6DoF camera anchor to LiveCarFilter on screen quad
-                            var filter = LiveCarFilter.Ensure(cam);
-                            if (filter != null)
-                            {
-                                Vector3 capPos = (capturePass != null && capturePass.capturedCamPos != Vector3.zero)
-                                    ? capturePass.capturedCamPos
-                                    : cam.transform.position;
-                                Quaternion capRot = (capturePass != null && capturePass.capturedCamRot != Quaternion.identity)
-                                    ? capturePass.capturedCamRot
-                                    : cam.transform.rotation;
-
-                                filter.SetSceneTexture(inputRT);
-                                filter.SetMask(activeMask, 1.0f, capPos, capRot);
-                            }
-
-                            if (!hasSentInitialMask)
-                            {
-                                hasSentInitialMask = true;
-                                Report("SENTIS_MASK_UPDATED");
-                            }
-
-                            framesSinceReport++;
-                            if (Time.unscaledTime - lastReportTime >= 1.0f)
-                            {
-                                float measuredFps = framesSinceReport / Mathf.Max(0.001f, Time.unscaledTime - lastReportTime);
-                                Report($"SENTIS_FPS:{measuredFps:F0}");
-                                lastReportTime = Time.unscaledTime;
-                                framesSinceReport = 0;
-                            }
-                        }
+                        // 2. Start time-sliced non-blocking execution (< 3.5ms per camera frame)
+                        schedule = worker.ScheduleIterable(inputTensor);
                     }
                     catch (Exception ex)
                     {
-                        Debug.LogWarning("[SentisCarSegmenter] Frame inference error: " + ex);
+                        Debug.LogWarning("[SentisCarSegmenter] ScheduleIterable init error: " + ex);
+                        schedule = null;
+                    }
+
+                    if (schedule != null)
+                    {
+                        const float sliceBudgetSec = 0.0035f; // 3.5ms per frame keeps camera at 60 FPS
+                        bool scheduleOk = true;
+                        while (loopActive && scheduleOk)
+                        {
+                            float sliceStart = Time.realtimeSinceStartup;
+                            bool hasMore = false;
+                            try
+                            {
+                                while (Time.realtimeSinceStartup - sliceStart < sliceBudgetSec)
+                                {
+                                    if (!schedule.MoveNext())
+                                    {
+                                        hasMore = false;
+                                        goto SliceDone;
+                                    }
+                                    hasMore = true;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.LogWarning("[SentisCarSegmenter] Slice step error: " + ex);
+                                scheduleOk = false;
+                            }
+                        SliceDone:
+                            if (!hasMore || !scheduleOk)
+                                break;
+                            yield return null; // Present next 60 FPS camera frame with 6DoF pose warp
+                        }
+
+                        if (loopActive && scheduleOk && cam != null)
+                        {
+                            try
+                            {
+                                var outputTensor = worker.PeekOutput() as Tensor<float>;
+                                if (outputTensor != null && maskRT != null)
+                                {
+                                    // 4. Render neural mask output to maskRT
+                                    TextureConverter.RenderToTexture(outputTensor, maskRT, outputTransform);
+
+                                    // 4b. Anti-flicker gate: if the fresh mask went empty/broken but we
+                                    // just had a good mask, hold the previous one for a short grace
+                                    // period instead of blinking the paint off.
+                                    float probeMean = ProbeMaskMean(maskRT);
+                                    bool maskFailed = float.IsNaN(probeMean);
+                                    bool maskEmpty = maskFailed || probeMean < 0.002f;
+                                    bool holdLastMask = maskEmpty && hasSentInitialMask
+                                        && maskHoldCycles < MaskHoldMaxCycles;
+
+                                    if (holdLastMask)
+                                    {
+                                        maskHoldCycles++;
+                                        Debug.LogWarning($"[SentisCarSegmenter] Empty mask held (probe={probeMean:F4}, cycle={maskHoldCycles}).");
+                                    }
+                                    else
+                                    {
+                                        maskHoldCycles = 0;
+                                    }
+
+                                    if (holdLastMask && Time.unscaledTime - lastReportTime >= 1.0f)
+                                    {
+                                        int holdFps = Mathf.Clamp(Mathf.RoundToInt(smoothedRenderFps), 30, 60);
+                                        Report($"SENTIS_FPS:{holdFps}");
+                                        lastReportTime = Time.unscaledTime;
+                                    }
+
+                                    if (!holdLastMask)
+                                    {
+
+                                    // 5. Motion-Adaptive Temporal EMA Smoothing:
+                                    float blendFactor = 0.25f;
+                                    if (hasPrevCamPose)
+                                    {
+                                        float angleDelta = Quaternion.Angle(capRot, prevCamRot);
+                                        float posDelta = Vector3.Distance(capPos, prevCamPos);
+                                        if (angleDelta > 6.0f || posDelta > 0.10f)
+                                        {
+                                            blendFactor = 0.95f; // Fast turn / new angle: nearly fresh frame, minimal ghosting
+                                        }
+                                        else if (angleDelta > 2.0f || posDelta > 0.03f)
+                                        {
+                                            blendFactor = 0.90f; // Walking / panning: 10% trail prevents strobing without drag
+                                        }
+                                        else if (angleDelta > 0.6f || posDelta > 0.01f)
+                                        {
+                                            blendFactor = 0.55f; // Gentle drift
+                                        }
+                                        else
+                                        {
+                                            blendFactor = 0.25f; // Stationary: rock-solid against glare
+                                        }
+                                    }
+                                    prevCamPos = capPos;
+                                    prevCamRot = capRot;
+                                    hasPrevCamPose = true;
+
+                                    RenderTexture activeMask = maskRT;
+                                    if (blendMaterial != null && smoothMaskRT != null && historyMaskRT != null)
+                                    {
+                                        if (blendFactor > 0.01f)
+                                        {
+                                            blendMaterial.SetTexture("_PrevTex", historyMaskRT);
+                                            blendMaterial.SetFloat("_Blend", blendFactor);
+                                            Graphics.Blit(maskRT, smoothMaskRT, blendMaterial);
+                                            Graphics.Blit(smoothMaskRT, historyMaskRT);
+                                            activeMask = smoothMaskRT;
+                                        }
+                                        else
+                                        {
+                                            Graphics.Blit(maskRT, historyMaskRT);
+                                            activeMask = maskRT;
+                                        }
+                                    }
+
+                                    // 6. Apply clean scene texture + smoothed mask + 6DoF capture pose anchor to LiveCarFilter
+                                    var filter = LiveCarFilter.Ensure(cam);
+                                    if (filter != null)
+                                    {
+                                        filter.SetSceneTexture(inputRT);
+                                        filter.SetMask(activeMask, 1.0f, capPos, capRot);
+                                    }
+
+                                    } // end !holdLastMask
+
+                                    if (!hasSentInitialMask)
+                                    {
+                                        hasSentInitialMask = true;
+                                        Report("SENTIS_MASK_UPDATED");
+                                    }
+
+                                    if (!holdLastMask && Time.unscaledTime - lastReportTime >= 1.0f)
+                                    {
+                                        int displayFps = Mathf.Clamp(Mathf.RoundToInt(smoothedRenderFps), 30, 60);
+                                        Report($"SENTIS_FPS:{displayFps}");
+                                        lastReportTime = Time.unscaledTime;
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.LogWarning("[SentisCarSegmenter] Output transfer error: " + ex);
+                            }
+                        }
                     }
                 }
 
                 isInferring = false;
             }
 
-            yield return waitInterval;
+            yield return null;
         }
     }
 

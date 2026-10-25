@@ -19,6 +19,8 @@ public class LiveCarFilter : MonoBehaviour
     float strength = 1.0f;
     float panel;
     float finishMode = 0f;
+    float debugMaskMode = 0f;
+    bool captureCleanHide = false;
 
     // Mask viewpoint anchor tracking
     Vector3 maskCamPos;
@@ -93,7 +95,7 @@ public class LiveCarFilter : MonoBehaviour
 
         if (material != null && maskApplied)
         {
-            material.SetFloat("_Strength", (maskApplied && !isLocked) ? strength : 0f);
+            material.SetFloat("_Strength", (maskApplied && !isLocked && !captureCleanHide) ? strength : 0f);
 
             // 6DoF Camera Reprojection: keeps the neural mask locked to vehicle sheet metal
             // between inference frames as the phone pans or rotates (Snapchat-style tracking)
@@ -245,6 +247,25 @@ public class LiveCarFilter : MonoBehaviour
         ApplyFinish();
     }
 
+    public void SetDebugMaskMode(bool enabled)
+    {
+        debugMaskMode = enabled ? 1f : 0f;
+        if (EnsureMaterial())
+            ApplyFinish();
+    }
+
+    public void SetCaptureCleanHide(bool hide)
+    {
+        captureCleanHide = hide;
+        var mr = GetComponent<MeshRenderer>();
+        if (mr != null)
+            mr.enabled = maskApplied && !hide;
+        if (lockedQuad != null && isLocked)
+            lockedQuad.SetActive(!hide);
+        if (material != null)
+            material.SetFloat("_Strength", (maskApplied && !isLocked && !hide) ? strength : 0f);
+    }
+
     public bool SetMask(Texture mask, float letterboxAspect = 1.0f, Vector3 capturePos = default, Quaternion captureRot = default)
     {
         if (mask == null)
@@ -259,7 +280,7 @@ public class LiveCarFilter : MonoBehaviour
         material.SetFloat("_LetterboxAspect", letterboxAspect);
 
         var mr = GetComponent<MeshRenderer>();
-        if (mr != null) mr.enabled = true;
+        if (mr != null) mr.enabled = !captureCleanHide;
 
         var camera = GetComponentInParent<Camera>();
         if (camera != null)
@@ -307,8 +328,9 @@ public class LiveCarFilter : MonoBehaviour
         material.SetFloat("_Smoothness", smoothness);
         material.SetFloat("_Panel", panel);
         material.SetFloat("_Finish", finishMode);
-        // Live shader OFF while showroom full frame is locked or when paused
-        material.SetFloat("_Strength", (maskApplied && !isLocked) ? strength : 0f);
+        material.SetFloat("_DebugMaskMode", debugMaskMode);
+        // Live shader OFF while showroom full frame is locked, paused, or capturing clean original photo
+        material.SetFloat("_Strength", (maskApplied && !isLocked && !captureCleanHide) ? strength : 0f);
     }
 
     bool EnsureMaterial()

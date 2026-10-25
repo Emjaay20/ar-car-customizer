@@ -80,6 +80,14 @@ class UnityCommands {
     );
   }
 
+  static UnityCommand setDebugMask(bool enabled) {
+    return UnityCommand(
+      gameObject: gameObject,
+      method: sentisMethod,
+      argument: enabled ? 'debug_mask_on' : 'debug_mask_off',
+    );
+  }
+
   static UnityCommand anchorToSurface() {
     return const UnityCommand(
       gameObject: gameObject,
