@@ -208,6 +208,17 @@ public class FlutterMessageReceiver : MonoBehaviour
             LoadSegmentationMask(frame.maskPng);
     }
 
+    public void CaptureLearningExample(string unused)
+    {
+        GetComponent<SentisCarSegmenter>()?.CaptureLearningExample();
+    }
+
+    public void SetLearningCapture(string enabled)
+    {
+        LearningSampleRecorder.Enabled = string.Equals(enabled, "true", StringComparison.OrdinalIgnoreCase);
+        SendMessageToFlutter(LearningSampleRecorder.Enabled ? "LEARNING_CAPTURE_ON" : "LEARNING_CAPTURE_OFF");
+    }
+
     public void RunSentis(string mode)
     {
         if (string.Equals(mode, "debug_mask_on", StringComparison.OrdinalIgnoreCase))
@@ -594,8 +605,12 @@ public class FlutterMessageReceiver : MonoBehaviour
         ReplayParts();
     }
 
+    bool snapshotInFlight;
+
     System.Collections.IEnumerator CaptureSnapshotRoutine(string mode)
     {
+        if (snapshotInFlight) { SendMessageToFlutter("SNAPSHOT_FAILED:busy"); yield break; }
+        snapshotInFlight = true;
         bool captureClean = string.Equals(mode, "clean", StringComparison.OrdinalIgnoreCase);
         var filter = captureClean ? LiveCarFilter.Ensure(Camera.main) : null;
         if (filter != null)
@@ -607,6 +622,7 @@ public class FlutterMessageReceiver : MonoBehaviour
 
         yield return new WaitForEndOfFrame();
         var texture = ScreenCapture.CaptureScreenshotAsTexture();
+        snapshotInFlight = false;
 
         if (filter != null)
             filter.SetCaptureCleanHide(false);
@@ -623,7 +639,7 @@ public class FlutterMessageReceiver : MonoBehaviour
 
         var path = Path.Combine(
             Application.persistentDataPath,
-            "ar-paint-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss") + ".jpg");
+            "ar-paint-" + Guid.NewGuid().ToString("N") + ".jpg");
         try
         {
             File.WriteAllBytes(path, bytes);

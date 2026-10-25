@@ -14,6 +14,7 @@ public class LiveCarFilter : MonoBehaviour
     Material material;
     bool reportedMissingShader;
     bool maskApplied;
+    float maskCapturedAt;
     float metallic = 0.08f;
     float smoothness = 0.92f;
     float strength = 1.0f;
@@ -92,6 +93,12 @@ public class LiveCarFilter : MonoBehaviour
         transform.localPosition = new Vector3(offsetX, offsetY, Distance);
         transform.localRotation = Quaternion.identity;
         transform.localScale = new Vector3(width, height, 1f);
+
+        // Never leave camera-aligned paint visible indefinitely while inference stalls.
+        if (maskApplied && !isLocked && (Time.unscaledTime - maskCapturedAt > 0.75f ||
+            (hasMaskPose && (Quaternion.Angle(camera.transform.rotation, maskCamRot) > 20f ||
+             Vector3.Distance(camera.transform.position, maskCamPos) > 0.5f))))
+            ClearLive();
 
         if (material != null && maskApplied)
         {
@@ -266,7 +273,7 @@ public class LiveCarFilter : MonoBehaviour
             material.SetFloat("_Strength", (maskApplied && !isLocked && !hide) ? strength : 0f);
     }
 
-    public bool SetMask(Texture mask, float letterboxAspect = 1.0f, Vector3 capturePos = default, Quaternion captureRot = default)
+    public bool SetMask(Texture mask, float letterboxAspect = 1.0f, Vector3 capturePos = default, Quaternion captureRot = default, float captureTime = -1f)
     {
         if (mask == null)
         {
@@ -276,6 +283,7 @@ public class LiveCarFilter : MonoBehaviour
 
         if (!EnsureMaterial()) return false;
         maskApplied = true;
+        maskCapturedAt = captureTime >= 0f ? captureTime : Time.unscaledTime;
         material.SetTexture("_MaskTex", mask);
         material.SetFloat("_LetterboxAspect", letterboxAspect);
 
@@ -321,9 +329,26 @@ public class LiveCarFilter : MonoBehaviour
             material.SetTexture("_SceneTex", sceneTex);
     }
 
+    [System.Serializable]
+    class WrapFinishProfile
+    {
+        public float matteFloor = 0.055f;
+        public float matteRange = 0.14f;
+        public float carbonBase = 0.07f;
+        public float carbonTiles = 120f;
+    }
+    static WrapFinishProfile finishProfile;
+
     void ApplyFinish()
     {
         if (material == null) return;
+        if (finishProfile == null)
+        {
+            var json = Resources.Load<TextAsset>("WrapFinishProfile");
+            finishProfile = json != null ? JsonUtility.FromJson<WrapFinishProfile>(json.text) : new WrapFinishProfile();
+        }
+        material.SetVector("_WrapProfile", new Vector4(finishProfile.matteFloor, finishProfile.matteRange,
+            finishProfile.carbonBase, finishProfile.carbonTiles));
         material.SetFloat("_Metallic", metallic);
         material.SetFloat("_Smoothness", smoothness);
         material.SetFloat("_Panel", panel);

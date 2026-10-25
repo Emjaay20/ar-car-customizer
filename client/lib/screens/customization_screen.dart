@@ -85,6 +85,8 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
   String? _paintColor = '#9B1B30';
   final _hex = TextEditingController();
   int _maskSlot = 0;
+  bool _collectLearningSamples = false;
+  int _learningSampleCount = 0;
   int _requestSequence = 0;
   int _latestProcessedSequence = 0;
   int _studioShareRetryCount = 0;
@@ -451,19 +453,21 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
               'repolishOnly': false,
               'hdMode': true,
               'fullCoverage': _coverageMode == 'full',
-              'frameId': 'req_$seq',
+              'frameId': '${file.uri.pathSegments.last}_$seq',
             },
           },
         ),
       );
 
       // Monotonic sequence guard: if a newer request was dispatched, discard stale response
-      if (seq < _latestProcessedSequence) {
+      if (!mounted || seq != _requestSequence || seq < _latestProcessedSequence ||
+          activePaint != _paintState) {
         return null;
       }
       _latestProcessedSequence = seq;
 
       final data = result.data?['segmentLiveCar'] as Map<String, dynamic>?;
+      if (data?['frameId'] != '${file.uri.pathSegments.last}_$seq') return null;
       final polishedB64 = data?['polishedBase64'] as String?;
       final isMasked = data?['masked'] == true;
 
@@ -861,6 +865,10 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       });
       return;
     }
+    if (text.startsWith('LEARNING_SAMPLE_SAVED:')) {
+      setState(() => _learningSampleCount++);
+      return;
+    }
     if (text.startsWith('SENTIS_STOPPED')) {
       setState(() {
         _sentisLiveActive = false;
@@ -902,6 +910,22 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
           _unityStatus = '🟢 On-Device Live AR';
         });
       }
+      return;
+    }
+    if (text.startsWith('SENTIS_TRACKING_LOST')) {
+      if (!_sentisLiveActive) return;
+      setState(() {
+        _hasActiveMask = false;
+        _unityStatus = 'Tracking lost · Hold steady to reacquire vehicle';
+      });
+      return;
+    }
+    if (text.startsWith('SENTIS_NO_VEHICLE')) {
+      if (!_sentisLiveActive) return;
+      setState(() {
+        _hasActiveMask = false;
+        _unityStatus = 'No reliable exterior mask · Frame the car with a wheel or light visible.';
+      });
       return;
     }
     if (text.startsWith('SENTIS_NO_MODEL')) {
@@ -1083,6 +1107,20 @@ class _CustomizationScreenState extends State<CustomizationScreen> {
       appBar: AppBar(
         title: Text(_displayVehicleTitle, style: const TextStyle(fontSize: 16)),
         actions: [
+          GestureDetector(
+            onLongPress: () => _post(const UnityCommand(gameObject: UnityCommands.gameObject,
+              method: 'CaptureLearningExample', argument: '')),
+            child: IconButton(
+            tooltip: 'Local review samples: $_learningSampleCount. Tap to toggle; hold to save last analysed frame. No automatic training or upload.',
+            icon: Icon(Icons.school_outlined, color: _collectLearningSamples ? Colors.cyan : Colors.grey),
+            onPressed: () {
+              setState(() => _collectLearningSamples = !_collectLearningSamples);
+              _post(UnityCommand(gameObject: UnityCommands.gameObject,
+                method: 'SetLearningCapture', argument: _collectLearningSamples.toString()));
+              _snack(_collectLearningSamples ? 'Local hard-example collection enabled. Labels require review.' : 'Local collection disabled.');
+            },
+            ),
+          ),
           IconButton(
             tooltip: 'Server Connection',
             icon: Icon(

@@ -11,7 +11,7 @@ using Unity.InferenceEngine;
 /// <summary>
 /// On-Device Snapchat-Style Live Car Segmentation & Tracking Engine.
 /// Runs CarSegMask.onnx (dual YOLOv8 vehicle + 17-part sheet-metal segmentation with window/grille/plate cutouts)
-/// 100% locally on the phone's CPU/NPU, requiring zero Wi-Fi, zero laptop server, and zero cloud API requests during live AR.
+/// Locally on the configured Sentis CPU backend, requiring zero Wi-Fi, zero laptop server, and zero cloud API requests during live AR.
 /// Captures the clean AR camera feed inside URP 17 RenderGraph at BeforeRenderingTransparents (before LiveCarPaint overlay
 /// and before RenderGraph.ClearGlobalBindings resets _CameraOpaqueTexture to black).
 /// Features Temporal Exponential Moving Average (EMA) smoothing for jitter-free, rock-solid paint edges.
@@ -84,6 +84,7 @@ public class SentisCarSegmenter : MonoBehaviour
     Material blendMaterial;
     CleanCameraCapturePass capturePass;
     bool modelLoaded;
+    string loadedModelName;
     bool isInferring;
 
     Vector3 prevCamPos;
@@ -98,8 +99,8 @@ public class SentisCarSegmenter : MonoBehaviour
 
     // Anti-flicker hold: brief model dropouts (motion judder, exposure shifts) must not
     // make the paint blink. Keep showing the last accepted mask for a short grace period.
-    int maskHoldCycles;
-    const int MaskHoldMaxCycles = 6; // Bounded hold to eliminate ghosting lag during fast camera pans
+    bool reportedNoVehicle;
+    float captureStartedAt;
     static RenderTexture probeRT;
     static Texture2D probeTex;
 
@@ -115,7 +116,7 @@ public class SentisCarSegmenter : MonoBehaviour
     {
         if (loopActive && Time.unscaledDeltaTime > 0.0001f)
         {
-            float instantFps = Mathf.Clamp(1.0f / Time.unscaledDeltaTime, 1f, 60f);
+            float instantFps = 1.0f / Time.unscaledDeltaTime;
             smoothedRenderFps = Mathf.Lerp(smoothedRenderFps, instantFps, 0.12f);
         }
     }
@@ -167,14 +168,17 @@ public class SentisCarSegmenter : MonoBehaviour
         {
             // Prefer the video-tuned export (parts-anchored presence, no giant-box silhouette):
             // see ml/video_testbed.py + scratch/corolla_testbed for validation on the Corolla walkaround.
+            var guardedAsset = Resources.Load<ModelAsset>("CarSegMaskGuarded");
             var tunedAsset = Resources.Load<ModelAsset>("CarSegMaskTuned");
-            var modelAsset = tunedAsset != null ? tunedAsset : Resources.Load<ModelAsset>("CarSegMask");
+            var modelAsset = guardedAsset != null ? guardedAsset : (tunedAsset != null ? tunedAsset : Resources.Load<ModelAsset>("CarSegMask"));
+            loadedModelName = guardedAsset != null ? "CarSegMaskGuarded-v1" : (tunedAsset != null ? "CarSegMaskTuned" : "CarSegMask");
             if (modelAsset == null)
             {
                 Debug.LogWarning("[SentisCarSegmenter] CarSegMask.onnx ModelAsset not found in Resources. Falling back to external mask mode.");
                 return;
             }
-            if (tunedAsset != null)
+            Debug.Log("[SentisCarSegmenter] Selected model: " + loadedModelName);
+            if (guardedAsset == null && tunedAsset != null)
             {
                 Debug.Log("[SentisCarSegmenter] Loaded video-tuned CarSegMaskTuned.onnx (validated on Corolla walkaround testbed).");
             }
@@ -182,9 +186,9 @@ public class SentisCarSegmenter : MonoBehaviour
             runtimeModel = ModelLoader.Load(modelAsset);
             // Use BackendType.CPU with time-sliced ScheduleIterable execution:
             // On Android OpenGL ES 3.0 (gles3), GPUCompute stalls on TopK/Gather readbacks.
-            // Time-sliced CPU (Burst/NEON) guarantees 100% accurate mask tensors while keeping camera locked at 60 FPS.
+            // Time-sliced CPU avoids scheduling the full network in one render tick; device performance must be measured.
             worker = new Worker(runtimeModel, BackendType.CPU);
-            Debug.Log("[SentisCarSegmenter] On-device Sentis model initialized with BackendType.CPU (time-sliced 60 FPS mode).");
+            Debug.Log("[SentisCarSegmenter] On-device Sentis model initialized with BackendType.CPU (time-sliced mode).");
             inputTensor = new Tensor<float>(new TensorShape(1, 3, ModelSize, ModelSize));
 
             inputRT = CreateClearedRT(ModelSize, ModelSize, enableRandomWrite: false);
@@ -239,6 +243,7 @@ public class SentisCarSegmenter : MonoBehaviour
     {
         loopActive = false;
         hasSentInitialMask = false;
+        reportedNoVehicle = false;
         if (capturePass != null)
             capturePass.requestCapture = false;
         if (loopCoroutine != null)
@@ -263,41 +268,52 @@ public class SentisCarSegmenter : MonoBehaviour
     }
 
     /// <summary>
-    /// Cheap 8x8 downsample readback of the fresh mask to detect empty/invalid outputs.
+    /// Thresholded 32x32 downsample readback of the fresh mask to detect empty/invalid outputs.
     /// Returns the mean, or float.NaN when the mask contains non-finite values (bad GPU run).
     /// </summary>
-    static float ProbeMaskMean(RenderTexture mask)
+    static float ProbeMaskMean(RenderTexture mask, out float coverage)
     {
+        coverage = 0f;
         try
         {
             if (probeRT == null)
             {
-                probeRT = CreateClearedRT(8, 8, enableRandomWrite: false);
-                probeTex = new Texture2D(8, 8, TextureFormat.RGBAFloat, false);
+                probeRT = CreateClearedRT(32, 32, enableRandomWrite: false);
+                probeTex = new Texture2D(32, 32, TextureFormat.RGBAFloat, false);
             }
             Graphics.Blit(mask, probeRT);
             var prev = RenderTexture.active;
             RenderTexture.active = probeRT;
-            probeTex.ReadPixels(new Rect(0, 0, 8, 8), 0, 0);
+            probeTex.ReadPixels(new Rect(0, 0, 32, 32), 0, 0);
             probeTex.Apply(false);
             RenderTexture.active = prev;
             var pix = probeTex.GetPixels();
             if (pix == null || pix.Length == 0)
                 return float.NaN;
             double sum = 0.0;
+            int selected = 0;
             bool finite = true;
             for (int i = 0; i < pix.Length; i++)
             {
                 float v = pix[i].r;
                 if (!float.IsFinite(v)) { finite = false; break; }
                 sum += v;
+                if (v > 0.16f) selected++;
             }
+            coverage = selected / (float)pix.Length; // Thresholded 32x32 sample coverage, not a mean proxy.
             return finite ? (float)(sum / pix.Length) : float.NaN;
         }
         catch (Exception)
         {
             return float.NaN;
         }
+    }
+
+    public void CaptureLearningExample()
+    {
+        var sample = LearningSampleRecorder.TryRecord(inputRT, maskRT,
+            "user-marked-last-inference", loadedModelName, true);
+        if (sample != null) Report("LEARNING_SAMPLE_SAVED:" + sample);
     }
 
     public void NotifyExternalMaskApplied()
@@ -338,6 +354,7 @@ public class SentisCarSegmenter : MonoBehaviour
             {
                 isInferring = true;
 
+                captureStartedAt = Time.unscaledTime;
                 // Request clean camera capture during URP RenderGraph (BeforeRenderingTransparents)
                 if (capturePass != null)
                 {
@@ -368,7 +385,7 @@ public class SentisCarSegmenter : MonoBehaviour
                     {
                         // 1. Convert 384x384 clean camera RT to [1, 3, 384, 384] RGB float tensor
                         TextureConverter.ToTensor(inputRT, inputTensor, inputTransform);
-                        // 2. Start time-sliced non-blocking execution (< 3.5ms per camera frame)
+                        // 2. Start time-sliced scheduling; execution cost must be profiled on-device
                         schedule = worker.ScheduleIterable(inputTensor);
                     }
                     catch (Exception ex)
@@ -379,7 +396,7 @@ public class SentisCarSegmenter : MonoBehaviour
 
                     if (schedule != null)
                     {
-                        const float sliceBudgetSec = 0.0020f; // 2.0ms per frame keeps camera locked at 60 FPS
+                        const float sliceBudgetSec = 0.0020f; // Scheduling budget only; individual layers can exceed it
                         bool scheduleOk = true;
                         while (loopActive && scheduleOk)
                         {
@@ -418,34 +435,37 @@ public class SentisCarSegmenter : MonoBehaviour
                                     // 4. Render neural mask output to maskRT
                                     TextureConverter.RenderToTexture(outputTensor, maskRT, outputTransform);
 
-                                    // 4b. Anti-flicker gate: dual coverage & mean check so dark cars (black Camry) are never dropped
-                                    float probeMean = ProbeMaskMean(maskRT);
-                                    bool maskFailed = float.IsNaN(probeMean);
-                                    float coverage = Mathf.Clamp01(probeMean * 3.5f);
-                                    bool maskEmpty = maskFailed || (probeMean < 0.0005f && coverage < 0.02f);
-                                    bool holdLastMask = maskEmpty && hasSentInitialMask
-                                        && maskHoldCycles < MaskHoldMaxCycles;
-
-                                    if (holdLastMask)
+                                    float coverage;
+                                    float probeMean = ProbeMaskMean(maskRT, out coverage);
+                                    bool stale = Time.unscaledTime - captureStartedAt > 0.75f;
+                                    bool maskEmpty = !float.IsFinite(probeMean) || coverage <= 0f || stale;
+                                    if (maskEmpty || coverage > 0.60f)
                                     {
-                                        maskHoldCycles++;
-                                        Debug.LogWarning($"[SentisCarSegmenter] Empty mask held (probe={probeMean:F4}, cycle={maskHoldCycles}).");
+                                        var sample = LearningSampleRecorder.TryRecord(inputRT, maskRT,
+                                            stale ? "stale-inference" : (maskEmpty ? "empty-or-unsupported" : "large-mask"), loadedModelName);
+                                        if (sample != null) Report("LEARNING_SAMPLE_SAVED:" + sample);
                                     }
-                                    else
+                                    if (maskEmpty)
                                     {
-                                        maskHoldCycles = 0;
+                                        LiveCarFilter.Ensure(cam)?.ClearLive();
+                                        foreach (var rt in new[] { historyMaskRT, smoothMaskRT })
+                                        {
+                                            if (rt == null) continue;
+                                            var previous = RenderTexture.active;
+                                            RenderTexture.active = rt;
+                                            GL.Clear(false, true, Color.black);
+                                            RenderTexture.active = previous;
+                                        }
+                                        hasPrevCamPose = false;
+                                        hasSentInitialMask = false;
+                                        if (!reportedNoVehicle)
+                                            Report(stale ? "SENTIS_TRACKING_LOST" : "SENTIS_NO_VEHICLE");
+                                        reportedNoVehicle = true;
                                     }
 
-                                    if (holdLastMask && Time.unscaledTime - lastReportTime >= 1.0f)
+                                    if (!maskEmpty)
                                     {
-                                        int holdFps = Mathf.Clamp(Mathf.RoundToInt(smoothedRenderFps), 30, 60);
-                                        Report($"SENTIS_FPS:{holdFps}");
-                                        lastReportTime = Time.unscaledTime;
-                                    }
-
-                                    if (!holdLastMask)
-                                    {
-
+                                    reportedNoVehicle = false;
                                     // 5. Motion-Adaptive Temporal EMA Smoothing:
                                     float blendFactor = 0.25f;
                                     if (hasPrevCamPose)
@@ -496,21 +516,22 @@ public class SentisCarSegmenter : MonoBehaviour
                                     if (filter != null)
                                     {
                                         filter.SetSceneTexture(inputRT);
-                                        filter.SetMask(activeMask, 1.0f, capPos, capRot);
+                                        filter.SetMask(activeMask, 1.0f, capPos, capRot, captureStartedAt);
                                     }
 
-                                    } // end !holdLastMask
+                                    } // end valid fresh mask
 
-                                    if (!hasSentInitialMask)
+                                    if (!maskEmpty && !hasSentInitialMask)
                                     {
                                         hasSentInitialMask = true;
                                         Report("SENTIS_MASK_UPDATED");
                                     }
 
-                                    if (!holdLastMask && Time.unscaledTime - lastReportTime >= 1.0f)
+                                    if (Time.unscaledTime - lastReportTime >= 1.0f)
                                     {
-                                        int displayFps = Mathf.Clamp(Mathf.RoundToInt(smoothedRenderFps), 30, 60);
+                                        int displayFps = Mathf.Max(0, Mathf.RoundToInt(smoothedRenderFps));
                                         Report($"SENTIS_FPS:{displayFps}");
+                                        Report($"SENTIS_METRICS:{probeMean:F4}:{coverage:F4}:{Time.unscaledTime - captureStartedAt:F3}");
                                         lastReportTime = Time.unscaledTime;
                                     }
                                 }

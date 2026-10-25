@@ -13,6 +13,8 @@ import json
 import os
 import sys
 import time
+import uuid
+from mask_quality import reconcile_silhouettes, validated_parts_fallback, constrain_paint, quality_reason, red_lamp_refinement, has_exterior_evidence
 from pathlib import Path
 
 import cv2
@@ -30,6 +32,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = "yolov8s-seg.pt" if (Path(__file__).resolve().parent / "yolov8s-seg.pt").exists() else "yolov8n-seg.pt"
 MODEL_PATH = Path(__file__).resolve().parent / os.environ.get("YOLO_SEG_MODEL", DEFAULT_MODEL)
 PUBLISH_DIR = ROOT / "backend" / "public" / "masks"
+FINISH_PROFILE = {"matteFloor": .055, "matteRange": .14, "carbonBase": .07, "carbonTiles": 120.0}
+_profile_path = ROOT / "My project" / "Assets" / "Resources" / "WrapFinishProfile.json"
+if _profile_path.exists():
+    FINISH_PROFILE.update(json.loads(_profile_path.read_text()))
+
 
 PARTS_MODEL_PATH = Path(__file__).resolve().parent / "parts_segmentation.pt"
 PARTS_MODEL = None
@@ -88,8 +95,8 @@ def cache_put_frame(frame_id: str, work_bgr: np.ndarray, paint_u8: np.ndarray, p
     }
 
 def cache_get_frame(frame_id: str | None) -> dict | None:
-    if frame_id and frame_id in FRAME_CACHE:
-        return FRAME_CACHE[frame_id]
+    if frame_id:
+        return FRAME_CACHE.get(frame_id)
     if FRAME_CACHE:
         newest_id = max(FRAME_CACHE.keys(), key=lambda k: FRAME_CACHE[k].get("ts", 0))
         return FRAME_CACHE[newest_id]
@@ -332,6 +339,8 @@ def build_paint_mask(
     return_plate: bool = False,
     panel: str = "body",
     full_coverage: bool = False,
+    debug_masks: dict | None = None,
+    parts_result=None,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Extract clean, hole-free automotive sheet-metal mask with Edge-Aware Guided Filtering
     and deep neural car-part segmentations (windshield, headlights, taillights, grille, wheels, license plate).
@@ -365,17 +374,21 @@ def build_paint_mask(
     parts_model = get_parts_model()
     cutout = np.zeros((h, w), dtype=np.uint8)
     body_panels_union = np.zeros((h, w), dtype=np.uint8)
+    lamp_support = np.zeros((h, w), dtype=np.uint8)
     license_plate = np.zeros((h, w), dtype=bool)
     panel_selected_mask = np.zeros((h, w), dtype=np.uint8) if panel in ("hood", "roof", "doors") else None
 
     if parts_model is not None:
-        parts_res = parts_model(frame_bgr, conf=0.10, verbose=False)[0]
+        parts_res = parts_result if parts_result is not None else parts_model(frame_bgr, conf=0.10, verbose=False)[0]
         if parts_res.masks is not None:
             for i, cls_id in enumerate(parts_res.boxes.cls):
                 part_name = parts_model.names[int(cls_id)]
                 conf = float(parts_res.boxes.conf[i])
                 m = parts_res.masks.data[i].cpu().numpy()
                 m_u8 = (cv2.resize(m, (w, h)) > 0.35).astype(np.uint8) * 255
+
+                if ('headlight' in part_name or 'tail-light' in part_name) and conf >= 0.20:
+                    lamp_support = cv2.bitwise_or(lamp_support, m_u8)
 
                 # 1. Body Panel Union: add detected trunk, hood, doors, roof, bumpers, fenders to solid
                 if part_name in PAINTABLE_BODY_PARTS and conf >= 0.10:
@@ -466,15 +479,9 @@ def build_paint_mask(
                     cv2.drawContours(solid, contours, i, 255, -1)
 
     if not full_coverage:
-        # 3. Optical red taillight protection: red lamp plastic has distinct chromaticity
-        b_ch, g_ch, r_ch = cv2.split(frame_bgr)
-        red_lamp = (r_ch.astype(np.int16) - g_ch.astype(np.int16) > 28) & \
-                   (r_ch.astype(np.int16) - b_ch.astype(np.int16) > 28) & \
-                   (r_ch > 70) & (solid > 0)
-        if np.any(red_lamp):
-            k_lamp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-            red_lamp_dil = cv2.dilate(red_lamp.astype(np.uint8) * 255, k_lamp)
-            cutout = cv2.bitwise_or(cutout, red_lamp_dil)
+        # Red paint must never be excluded solely because it resembles red plastic.
+        # Colour refinement is allowed only next to semantically detected lamps.
+        cutout = cv2.bitwise_or(cutout, red_lamp_refinement(frame_bgr, lamp_support, solid))
 
     # 4. Rubber trim edge protection: strictly for light-colored cars (white/silver/yellow)
     # Dark vehicles (median < 115) already have dark body metal, so thresholding < 52 eats pillars!
@@ -532,6 +539,8 @@ def build_paint_mask(
     grown = cv2.bitwise_and(grown, solid)
     grown[cutout > 0] = 0
     final_mask = grown
+    if debug_masks is not None:
+        debug_masks.update(body_union=body_panels_union.copy(), protected_parts=cutout.copy(), base_paint=base_paint.copy())
     if return_plate:
         return final_mask, license_plate
     return final_mask
@@ -782,8 +791,8 @@ def studio_polish_car_paint(
 
     # Seam-free HDR Clearcoat Reflection Layer (captures sky, clouds, trees & horizon reflections without white-paint wash)
     min_neighbor_luma = cv2.erode(gray, np.ones((7, 7), np.float32))
-    seam_free = np.clip((min_neighbor_luma - 0.48) / 0.18, 0.0, 1.0)
-    hdr_env_reflect = np.clip((broad_luma - macro_luma - 0.006) / 0.085, 0.0, 1.0) * seam_free
+    seam_free = 1.0 / (1.0 + np.exp(-(min_neighbor_luma - 0.46) / 0.12))
+    hdr_env_reflect = np.tanh(np.maximum(broad_luma - macro_luma - 0.006, 0.0) / 0.14) * seam_free
     hdr_reflection = hdr_env_reflect[:, :, None]
     hdr_sun_glint = ((np.clip((gray - 0.78) / 0.20, 0.0, 1.0) ** 5.0) * seam_free)[:, :, None]
 
@@ -865,15 +874,16 @@ def studio_polish_car_paint(
         # True Neutral Paint (Matte Black, Metallic Silver, Pure White, Charcoal, Carbon):
         if finish == "carbon":
             gy, gx = np.ogrid[:h, :w]
-            cu_x = (gx * (180.0 / float(w))) % 1.0
-            cu_y = (gy * (180.0 / float(h))) % 1.0
-            weave = np.where((cu_x > 0.5) ^ (cu_y > 0.5), 0.72, 1.35)[:, :, None]
-            effective_albedo = np.array([0.09, 0.09, 0.10], dtype=np.float32) * weave * np.clip(0.75 + 0.50 * norm_shade, 0.50, 1.30)[:, :, None]
+            tiles = FINISH_PROFILE["carbonTiles"]
+            twill = (np.floor(gx * tiles / w) + np.floor(gy * tiles / h)) % 4 < 2
+            weave = np.where(twill, 0.82, 1.18)[:, :, None]
+            base = FINISH_PROFILE["carbonBase"]
+            effective_albedo = np.array([base, base, base + .01], dtype=np.float32) * weave * np.clip(0.70 + 0.45 * norm_shade, 0.55, 1.15)[:, :, None]
         elif finish == "matte":
             norm_shade = np.clip((smooth_luma - p5) / max(p95 - p5, 0.15), 0.0, 1.0)
             if target_luma < 0.12:
                 # Realistic 3D Automotive Matte Black (e.g. 3M 2080 Deep Matte Black)
-                body_luma = 0.028 + 0.068 * norm_shade
+                body_luma = FINISH_PROFILE["matteFloor"] + FINISH_PROFILE["matteRange"] * norm_shade
                 base_matte = np.stack([body_luma, body_luma, body_luma + 0.003], axis=-1)
                 velvet_sheen = 0.016 * (np.clip((smooth_luma - 0.35) / 0.65, 0.0, 1.0) ** 2.0)[:, :, None]
                 effective_albedo = base_matte + velvet_sheen
@@ -887,16 +897,20 @@ def studio_polish_car_paint(
             else:
                 # Gloss / Satin / Metallic Neutral (Silver, Grey, White):
                 # Modulated by intrinsic normalized shading (norm_shade) so dark cars don't crush silver to grey
-                surface_illum = np.clip(ambient_floor + direct_scale * norm_shade, 0.35, 1.25)[:, :, None]
+                # Soft-compress the crown so a sky reflection on a dark hood
+                # does not turn Metallic Silver into a white island.
+                shade = np.tanh(norm_shade * 1.4) / np.tanh(1.4)
+                surface_illum = np.clip(ambient_floor + direct_scale * shade, 0.42, 0.92)[:, :, None]
                 effective_albedo = target_bgr[None, None, :] * surface_illum
     else:
         # Non-neutral Colored Pigments (Candy Red, Velocity Red, Marina Blue, etc.)
         if finish == "carbon":
             gy, gx = np.ogrid[:h, :w]
-            cu_x = (gx * (180.0 / float(w))) % 1.0
-            cu_y = (gy * (180.0 / float(h))) % 1.0
-            weave = np.where((cu_x > 0.5) ^ (cu_y > 0.5), 0.72, 1.35)[:, :, None]
-            effective_albedo = np.array([0.09, 0.09, 0.10], dtype=np.float32) * weave * np.clip(0.75 + 0.50 * norm_shade, 0.50, 1.30)[:, :, None]
+            tiles = FINISH_PROFILE["carbonTiles"]
+            twill = (np.floor(gx * tiles / w) + np.floor(gy * tiles / h)) % 4 < 2
+            weave = np.where(twill, 0.82, 1.18)[:, :, None]
+            base = FINISH_PROFILE["carbonBase"]
+            effective_albedo = np.array([base, base, base + .01], dtype=np.float32) * weave * np.clip(0.70 + 0.45 * norm_shade, 0.55, 1.15)[:, :, None]
         elif finish == "matte":
             # 100% Solid Velvet Automotive Basecoat (e.g. Carmine Red)
             surface_illum = np.clip(ambient_floor + direct_scale * norm_shade, 0.55, 1.15)[:, :, None]
@@ -922,6 +936,8 @@ def studio_polish_car_paint(
     # Matte finish (3M 2080 Matte Stealth) has zero clearcoat glint and zero sky reflection
     if finish == "matte":
         specular_layer = np.zeros_like(diffuse_layer)
+    elif finish == "carbon":
+        specular_layer = np.ones_like(diffuse_layer) * (hdr_reflection * .12 + hdr_sun_glint * .22)
     elif finish == "satin":
         fresnel_sheen = (clearcoat_f0 + (clearcoat_grazing - clearcoat_f0) * grazing)[:, :, None]
         satin_crown = (np.power(norm_shade, 2.2) * 0.12)[:, :, None]
@@ -1048,7 +1064,7 @@ def process_frame(
                         if yolo_car is not None:
                             k_env = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
                             car_envelope = cv2.dilate(yolo_car, k_env, iterations=1)
-                            s_mask = cv2.bitwise_and(s_mask, car_envelope)
+                            s_mask = reconcile_silhouettes(s_mask, yolo_car, box)
                         primary_mask = s_mask
                         source = "meta-sam2-hd"
                 except Exception as e:
@@ -1061,22 +1077,23 @@ def process_frame(
                 parts_mod = get_parts_model()
                 if parts_mod is not None:
                     p_res = parts_mod.predict(infer_bgr, conf=0.10, retina_masks=True, verbose=False)[0]
-                    if p_res.masks is not None and len(p_res.masks.data) > 0:
-                        primary_mask = p_res.masks.data.max(dim=0)[0].cpu().numpy()
-                        if primary_mask.shape != (work_h, work_w):
-                            primary_mask = cv2.resize(primary_mask, (work_w, work_h), interpolation=cv2.INTER_LINEAR)
-                if primary_mask is None:
-                    primary_mask = fallback_center_panel_mask(work_bgr)
+                    primary_mask = validated_parts_fallback(p_res, parts_mod.names, (work_h, work_w))
                 if primary_mask is None or not np.any(primary_mask > 0.2):
                     return {"ok": False, "reason": "Point camera clearly at a vehicle to lock live paint mask"}
-            source = "yolov8s-seg-hd" if hd_mode else "yolov8s-seg"
+            source = locals().get("source", "yolov8-seg-hd" if hd_mode else "yolov8-seg")
         else:
             return {
                 "ok": False,
                 "reason": "YOLO AI runs on Local PC. Tap the DNS icon in top bar to connect to Local PC (192.168.100.66).",
             }
 
-        paint_u8, plate_bool = build_paint_mask(work_bgr, primary_mask, return_plate=True, panel=panel, full_coverage=full_coverage)
+        parts_mod = get_parts_model()
+        exterior_parts = parts_mod.predict(infer_bgr, conf=0.10, retina_masks=True, verbose=False)[0] if parts_mod is not None else None
+        if not has_exterior_evidence(exterior_parts, parts_mod.names if parts_mod is not None else {}, primary_mask):
+            return {"ok": False, "frameId": frame_id, "reason": "unsupported-view: frame exterior body with a wheel or light visible"}
+        stages = {} if os.environ.get("ARCAR_DEBUG_DIR") else None
+        paint_u8, plate_bool = build_paint_mask(work_bgr, primary_mask, return_plate=True, panel=panel, full_coverage=full_coverage, debug_masks=stages, parts_result=exterior_parts)
+        paint_u8 = constrain_paint(paint_u8, primary_mask, plate_bool)
 
         # Multi-frame temporal consensus against previous cached frame when IoU >= 0.92
         prev_cached = cache_get_frame(None)
@@ -1092,9 +1109,10 @@ def process_frame(
                     255,
                 ).astype(np.uint8)
 
-        effective_frame_id = frame_id if frame_id else f"frame_{int(time.time() * 1000)}"
-        cache_put_frame(effective_frame_id, work_bgr, paint_u8, plate_bool, source, solid_u8=primary_mask)
+        effective_frame_id = frame_id if frame_id else uuid.uuid4().hex
 
+    if not repolish_only:
+        paint_u8 = constrain_paint(paint_u8, primary_mask, plate_bool)
     solid_silhouette = cached.get("solid") if (repolish_only and cached is not None) else locals().get("primary_mask", None)
     polished_bgr = studio_polish_car_paint(
         work_bgr,
@@ -1108,23 +1126,31 @@ def process_frame(
     intrinsic_mask_bgr = encode_intrinsic_mask_bgr(work_bgr, paint_u8, plate_bool)
 
     paint_pixels = int(np.count_nonzero(paint_u8 > 64))
-    if hd_mode and (paint_pixels < 200 and (paint_pixels / float(work_w * work_h)) < 0.0005):
-        if solid_silhouette is not None and np.count_nonzero(solid_silhouette) > 0:
-            paint_u8 = cv2.resize(solid_silhouette, (work_w, work_h))
-        else:
-            paint_u8 = np.maximum(paint_u8, (mask_u8 > 32).astype(np.uint8) * 255)
-        # Re-polish with fallback mask so HD cut never fails with toast
-        polished_bgr = studio_polish_car_paint(
-            work_bgr,
-            paint_u8,
-            hex_color=hex_color,
-            finish=finish,
-            panel=panel,
-            license_plate=plate_bool,
-            solid_silhouette=solid_silhouette,
-        )
-        intrinsic_mask_bgr = encode_intrinsic_mask_bgr(work_bgr, paint_u8, plate_bool)
+    failure = quality_reason(paint_u8, solid_silhouette, panel) if solid_silhouette is not None else "no-vehicle"
+    # Debug artifacts are private/opt-in and uniquely named; never publish raw captures.
+    debug_root = os.environ.get("ARCAR_DEBUG_DIR")
+    if debug_root:
+        debug_dir = Path(debug_root) / uuid.uuid4().hex
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(debug_dir / "source.jpg"), work_bgr)
+        cv2.imwrite(str(debug_dir / "paint.png"), paint_u8)
+        if solid_silhouette is not None:
+            cv2.imwrite(str(debug_dir / "silhouette.png"), (solid_silhouette > .2).astype(np.uint8)*255)
+        for stage in ("yolo_car", "s_mask", "primary_mask"):
+            stage_mask = locals().get(stage)
+            if stage_mask is not None:
+                cv2.imwrite(str(debug_dir / (stage + ".png")), (stage_mask > .2).astype(np.uint8)*255)
+        for stage, pixels in (locals().get("stages") or {}).items():
+            cv2.imwrite(str(debug_dir / (stage + ".png")), pixels)
+        cv2.imwrite(str(debug_dir / "plate.png"), plate_bool.astype(np.uint8)*255)
+        (debug_dir / "metadata.json").write_text(json.dumps({"frameId": effective_frame_id, "source": source,
+            "finish": finish, "panel": panel, "paintPixels": paint_pixels, "failure": failure}))
+    if hd_mode and failure:
+        FRAME_CACHE.pop(effective_frame_id, None)
+        return {"ok": False, "frameId": effective_frame_id, "reason": failure}
 
+    if not repolish_only:
+        cache_put_frame(effective_frame_id, work_bgr, paint_u8, plate_bool, source, solid_u8=primary_mask)
 
     ok_enc, png_buf = cv2.imencode(".png", intrinsic_mask_bgr)
     ok_pol, pol_buf = cv2.imencode(".jpg", polished_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])

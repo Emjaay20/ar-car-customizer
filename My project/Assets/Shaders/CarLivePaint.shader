@@ -2,6 +2,7 @@ Shader "ARCar/LivePaint"
 {
     Properties
     {
+        _WrapProfile ("Matte floor/range, carbon base/tiles", Vector) = (0.055, 0.14, 0.07, 120)
         _MaskTex ("Segmentation mask", 2D) = "black" {}
         _SceneTex ("Live camera scene", 2D) = "black" {}
         _Tint ("Tint", Color) = (0.61, 0.11, 0.19, 1)
@@ -50,6 +51,7 @@ Shader "ARCar/LivePaint"
 
             CBUFFER_START(UnityPerMaterial)
                 float4 _Tint;
+                float4 _WrapProfile;
                 float _Strength;
                 float _Metallic;
                 float _Smoothness;
@@ -231,8 +233,9 @@ Shader "ARCar/LivePaint"
                 // Crevice-only detail ratio: darkens panel gaps & door handles (<1.0), never boosts bright edges next to dark seams
                 float detailRatio = clamp((rawLuma + 0.03) / (broadLuma + 0.03), 0.60, 1.01);
                 // Seam-free HDR clearcoat reflection: captures sky/palm-tree reflections on hood & roof without white-paint wash
-                float seamFree = smoothstep(0.48, 0.66, minNeighborLuma);
-                float envReflect = smoothstep(0.006, 0.085, broadLuma - macroLuma * 1.003) * seamFree;
+                float seamFree = 1.0 / (1.0 + exp(-(minNeighborLuma - 0.46) / 0.12));
+                float residual = max(broadLuma - macroLuma - 0.006, 0.0) / 0.14;
+                float envReflect = ((1.0 - exp(-2.0 * residual)) / (1.0 + exp(-2.0 * residual))) * seamFree;
 
                 // Crisp shutlines / panel gaps (DDX/DDY on perceptual luma)
                 float lumaDx = ddx(rawLuma);
@@ -250,7 +253,7 @@ Shader "ARCar/LivePaint"
                     // === 1. 3M 2080 MATTE STEALTH FINISH (0% clearcoat glint, deep solid diffuse) ===
                     if (targetLuma < 0.15)
                     {
-                        float bodyLuma = 0.032 + 0.050 * normShade;
+                        float bodyLuma = _WrapProfile.x + _WrapProfile.y * normShade;
                         float velvetSheen = pow(normShade, 2.0) * 0.012;
                         diffuse = (float3(bodyLuma, bodyLuma, bodyLuma + 0.002) + velvetSheen) * ao;
                     }
@@ -279,10 +282,11 @@ Shader "ARCar/LivePaint"
                 else if (_Finish > 2.5 && _Finish < 3.5)
                 {
                     // === 3. METALLIC FINISH (anisotropic metallic micro-flake + clearcoat) ===
-                    float flake = saturate(abs(lumaDx) + abs(lumaDy)) * 0.32;
-                    diffuse = tintSrgb * clamp(0.48 + 0.54 * normShade, 0.44, 1.16) * (1.0 + flake) * ao;
-                    float directGlint = pow(saturate((rawLuma - 0.70) / 0.30), 28.0);
-                    specular = float3(0.98, 0.99, 1.0) * (envReflect * 0.35 + directGlint * 0.58);
+                    float flake = saturate(abs(lumaDx) + abs(lumaDy)) * 0.18;
+                    float metalShade = normShade / (1.0 + 0.85 * normShade);
+                    diffuse = tintSrgb * clamp(0.42 + 0.40 * metalShade, 0.38, 0.88) * (1.0 + flake) * ao;
+                    float directGlint = pow(saturate((rawLuma - 0.82) / 0.18), 28.0);
+                    specular = float3(0.98, 0.99, 1.0) * (envReflect * 0.12 + directGlint * 0.28);
                 }
                 else if (_Finish > 3.5 && _Finish < 4.5)
                 {
@@ -297,11 +301,11 @@ Shader "ARCar/LivePaint"
                 else if (_Finish >= 4.5)
                 {
                     // === 5. 2x2 TWILL WOVEN CARBON FIBER ===
-                    float2 carbonUV = frac(uv * 180.0);
-                    float carbonWeave = ((carbonUV.x > 0.5) ^ (carbonUV.y > 0.5)) ? 0.72 : 1.35;
-                    diffuse = float3(0.09, 0.09, 0.10) * carbonWeave * lerp(0.75, 1.25, normShade) * ao;
+                    float2 carbonUV = uv * _WrapProfile.w;
+                    float carbonWeave = (fmod(floor(carbonUV.x) + floor(carbonUV.y), 4.0) < 2.0) ? 0.82 : 1.18;
+                    diffuse = float3(_WrapProfile.z, _WrapProfile.z, _WrapProfile.z + 0.01) * carbonWeave * lerp(0.70, 1.15, normShade) * ao;
                     float directGlint = pow(saturate((rawLuma - 0.72) / 0.28), 20.0);
-                    specular = float3(1.0, 1.0, 1.0) * (envReflect * 0.30 + directGlint * 0.45);
+                    specular = float3(1.0, 1.0, 1.0) * (envReflect * 0.12 + directGlint * 0.22);
                 }
                 else
                 {
@@ -357,8 +361,6 @@ Shader "ARCar/LivePaint"
 
                 float smoothMask = SampleAntiAliasedMask(maskUV, screenUV, scene);
                 // Protect dark rubber window seals, mirror glass, and tire edges near mask boundaries
-                if (smoothMask < 0.82 && rawLuma < 0.14)
-                    smoothMask *= smoothstep(0.05, 0.14, rawLuma);
 
                 float mask = smoothMask * PanelGate(input.uv, _Panel);
 
@@ -411,6 +413,7 @@ Shader "ARCar/LivePaint"
             sampler2D _MaskTex;
             sampler2D _SceneTex;
             fixed4 _Tint;
+            float4 _WrapProfile;
             float _Strength;
             float _Metallic;
             float _Smoothness;
@@ -536,8 +539,6 @@ Shader "ARCar/LivePaint"
                 float normShade = saturate((rawLuma - 0.05) / 0.85);
 
                 float smoothMask = SampleAntiAliasedMaskCG(maskUV);
-                if (smoothMask < 0.82 && rawLuma < 0.14)
-                    smoothMask *= smoothstep(0.05, 0.14, rawLuma);
                 float mask = smoothMask * PanelGate(input.uv, _Panel);
 
                 if (_DebugMaskMode > 0.5)
@@ -563,7 +564,7 @@ Shader "ARCar/LivePaint"
                     // Matte
                     if (targetLuma < 0.15)
                     {
-                        float bodyLuma = 0.030 + 0.048 * normShade;
+                        float bodyLuma = _WrapProfile.x + _WrapProfile.y * normShade;
                         float velvetSheen = pow(normShade, 2.0) * 0.012;
                         diffuse = (float3(bodyLuma, bodyLuma, bodyLuma + 0.002) + velvetSheen) * ao;
                     }
@@ -609,9 +610,9 @@ Shader "ARCar/LivePaint"
                 else if (_Finish >= 4.5)
                 {
                     // === 5. 2x2 TWILL WOVEN CARBON FIBER ===
-                    float2 carbonUV = frac(input.uv * 180.0);
-                    float carbonWeave = ((carbonUV.x > 0.5) ^ (carbonUV.y > 0.5)) ? 0.72 : 1.35;
-                    diffuse = float3(0.09, 0.09, 0.10) * carbonWeave * lerp(0.75, 1.25, normShade) * ao;
+                    float2 carbonUV = input.uv * _WrapProfile.w;
+                    float carbonWeave = (fmod(floor(carbonUV.x) + floor(carbonUV.y), 4.0) < 2.0) ? 0.82 : 1.18;
+                    diffuse = float3(_WrapProfile.z, _WrapProfile.z, _WrapProfile.z + 0.01) * carbonWeave * lerp(0.75, 1.25, normShade) * ao;
                     float directGlint = pow(saturate((rawLuma - 0.72) / 0.28), 20.0);
                     specular = float3(1.0, 1.0, 1.0) * directGlint * 0.45;
                 }

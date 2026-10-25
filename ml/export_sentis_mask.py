@@ -12,16 +12,17 @@ from ultralytics import YOLO
 class VehiclePaintMaskWrapper(nn.Module):
     """
     On-device Neural Car Paint Sheet-Metal Mask model for Unity Sentis.
-    Input:  float32 [1, 3, 256, 256] RGB 0..1 (matches the 1:1 Unity AR viewport)
-    Output: float32 [1, 1, 256, 256] paint probability 0..1 with:
+    Input:  float32 [1, 3, 384, 384] RGB 0..1 (matches the 1:1 Unity AR viewport)
+    Output: float32 [1, 1, 384, 384] paint probability 0..1 with:
       - Dual-head union: whole-vehicle silhouette (YOLOv8n-seg) + per-class best sheet-metal panels (parts_segmentation)
       - Per-class best non-paint cutout exclusion: windshield, side windows, headlights, taillights, grille, wheels, license plate
       - 100% Pure float ops (no boolean And/Cast or GatherElements) for 100% compatibility with Unity Sentis CPU backend
       - Strictly 0.000 baseline outside the vehicle and when no vehicle is in view
     """
 
-    def __init__(self, car_pt: str = "yolov8n-seg.pt", parts_pt: str = "parts_segmentation.pt"):
+    def __init__(self, car_pt: str = "yolov8n-seg.pt", parts_pt: str = "parts_segmentation.pt", guarded: bool = False):
         super().__init__()
+        self.guarded = guarded
         self.car_yolo = YOLO(car_pt).model
         self.car_yolo.eval()
         self.parts_yolo = YOLO(parts_pt).model
@@ -252,27 +253,78 @@ class VehiclePaintMaskWrapper(nn.Module):
         clean_body = torch.clamp(body - cutout * 1.45, 0.0, 1.0) * ground_gate
 
         # 5. In-Graph 384x384 Fast Edge-Guided Filter
-        smooth_96 = F.avg_pool2d(clean_body, kernel_size=3, stride=1, padding=1)
+        smooth_96 = F.avg_pool2d(clean_body, kernel_size=3, stride=1, padding=1, count_include_pad=not self.guarded)
         p = F.interpolate(smooth_96, size=(384, 384), mode="bilinear", align_corners=False)
         I = luma_384
 
-        mean_I = F.avg_pool2d(I, kernel_size=9, stride=1, padding=4)
-        mean_p = F.avg_pool2d(p, kernel_size=9, stride=1, padding=4)
-        mean_Ip = F.avg_pool2d(I * p, kernel_size=9, stride=1, padding=4)
-        mean_II = F.avg_pool2d(I * I, kernel_size=9, stride=1, padding=4)
+        mean_I = F.avg_pool2d(I, kernel_size=9, stride=1, padding=4, count_include_pad=not self.guarded)
+        mean_p = F.avg_pool2d(p, kernel_size=9, stride=1, padding=4, count_include_pad=not self.guarded)
+        mean_Ip = F.avg_pool2d(I * p, kernel_size=9, stride=1, padding=4, count_include_pad=not self.guarded)
+        mean_II = F.avg_pool2d(I * I, kernel_size=9, stride=1, padding=4, count_include_pad=not self.guarded)
 
         cov_Ip = mean_Ip - mean_I * mean_p
         var_I = torch.clamp(mean_II - mean_I * mean_I, min=0.0) + 0.0015
         a = cov_Ip / var_I
         b = mean_p - a * mean_I
 
-        mean_a = F.avg_pool2d(a, kernel_size=9, stride=1, padding=4)
-        mean_b = F.avg_pool2d(b, kernel_size=9, stride=1, padding=4)
+        mean_a = F.avg_pool2d(a, kernel_size=9, stride=1, padding=4, count_include_pad=not self.guarded)
+        mean_b = F.avg_pool2d(b, kernel_size=9, stride=1, padding=4, count_include_pad=not self.guarded)
         guided_384 = torch.clamp(mean_a * I + mean_b, 0.0, 1.0)
 
         sharp_metal = torch.clamp((guided_384 - 0.08) / 0.42, 0.0, 1.0)
 
         final_mask = torch.clamp(sharp_metal, 0.0, 1.0) * car_presence
+        if self.guarded:
+            # Select one foreground instance using confidence, extent and centrality.
+            # The highest-confidence anchor alone can belong to a distant parked car.
+            conf, indices = torch.topk(veh_scores, k=20, dim=0)
+            boxes = car_main[0:4, indices]
+            area = torch.clamp(boxes[2] * boxes[3] / (384.0 * 384.0), 0.0, 1.0)
+            dx = (boxes[0] - 192.0) / 384.0
+            dy = (boxes[1] - 192.0) / 384.0
+            centrality = torch.clamp(1.0 - dx * dx - dy * dy, 0.25, 1.0)
+            rank = conf * torch.sqrt(area + 1e-6) * centrality
+            _, chosen = torch.topk(rank, k=1)
+            idx = indices[chosen]
+            selected_conf = conf[chosen]
+            envelope = self._eval_anchors_batched(
+                car_main, car_proto_flat, idx, selected_conf,
+                coeff_start=84, score_thresh=0.08, logit_thresh=0.0,
+            )
+            envelope = F.interpolate(envelope, size=(384, 384), mode="bilinear", align_corners=False)
+            envelope = torch.clamp((envelope - 0.08) * 8.0, 0.0, 1.0)
+            # Conservative abstention on ambiguous cabin/unsupported views.
+            # No colour or fixed screen-position rule authorizes background paint.
+            accepted = torch.clamp((selected_conf - 0.35) * 20.0, 0.0, 1.0).view(1, 1, 1, 1)
+            exterior_classes = self.wheel_indices + [3, 12, 16, 17, 25, 29]
+            landmark_scores = best_part_scores_k4[exterior_classes, 0]
+            landmark_indices = best_part_idx_k4[exterior_classes, 0]
+            landmark_xy = parts_main[0:2, landmark_indices]
+            selected_box = car_main[0:4, idx].view(4, 1)
+            # Reject landmarks from other parked cars; class evidence belongs to this instance.
+            within = torch.clamp(1.0 - torch.abs(landmark_xy - selected_box[0:2]) /
+                                 (selected_box[2:4] * 0.5 + 1e-4), 0.0, 1.0)
+            spatial_support = torch.clamp(within.min(dim=0)[0] * 20.0, 0.0, 1.0)
+            exterior_score = (landmark_scores * spatial_support).max()
+            exterior_gate = torch.clamp((exterior_score - 0.30) * 10.0, 0.0, 1.0)
+            accepted = accepted * exterior_gate
+            guarded_mask = final_mask * envelope * accepted
+            # Side-window crops can show no wheel or lamp. A confidently detected
+            # window + side mirror + vehicle is a separate, bounded parts mode.
+            window_score = best_part_scores_k4[self.win_indices, 0].max()
+            mirror_score = best_part_scores_k4[self.mirror_indices, 0].max()
+            side_gate = torch.clamp((window_score - 0.70) * 10.0, 0.0, 1.0) * torch.clamp((mirror_score - 0.60) * 10.0, 0.0, 1.0)
+            side_vehicle_gate = torch.clamp((selected_conf - 0.35) * 10.0, 0.0, 1.0).view(1,1,1,1)
+            # Whole-car detection weakens in tight front/rear crops. Permit a
+            # parts-only view only with two independent high-confidence physical
+            # exterior landmarks, and never grow beyond predicted body panels.
+            physical, _ = torch.topk(landmark_scores, k=2)
+            closeup_gate = torch.clamp((physical[1] - 0.50) * 10.0, 0.0, 1.0)
+            weak_detector = torch.clamp((0.35 - selected_conf) * 20.0, 0.0, 1.0).view(1,1,1,1)
+            panel_support = F.interpolate(parts_paint, size=(384,384), mode="bilinear", align_corners=False)
+            closeup_mask = final_mask * torch.clamp(panel_support * 2.0, 0.0, 1.0) * closeup_gate * weak_detector
+            side_mask = final_mask * torch.clamp(panel_support * 2.0, 0.0, 1.0) * side_gate * side_vehicle_gate
+            final_mask = torch.maximum(torch.maximum(guarded_mask, closeup_mask), side_mask)
         return torch.clamp(final_mask, 0.0, 1.0)
 
 
