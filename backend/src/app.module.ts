@@ -10,6 +10,8 @@ import { PrismaModule } from './prisma/prisma.module.js';
 import { VisionModule } from './vision/vision.module.js';
 import { InspectionModule } from './inspection/inspection.module.js';
 import { JobCardModule } from './jobcard/jobcard.module.js';
+import { AiWrapModule } from './ai-wrap/ai-wrap.module.js';
+import { SelfLearningModule } from './self-learning/self-learning.module.js';
 
 @Module({
   imports: [
@@ -25,6 +27,8 @@ import { JobCardModule } from './jobcard/jobcard.module.js';
     VisionModule,
     InspectionModule,
     JobCardModule,
+    AiWrapModule,
+    SelfLearningModule,
   ],
   controllers: [AppController],
   providers: [AppService],

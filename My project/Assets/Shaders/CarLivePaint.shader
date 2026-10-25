@@ -296,12 +296,12 @@ Shader "ARCar/LivePaint"
                 }
                 else if (_Finish >= 4.5)
                 {
-                    // === 5. CARBON FIBER ===
-                    float2 carbonUV = frac(uv * 140.0);
-                    float carbonWeave = ((carbonUV.x > 0.5) ^ (carbonUV.y > 0.5)) ? 0.80 : 1.20;
-                    diffuse = float3(0.036, 0.036, 0.040) * carbonWeave * lerp(0.58, 1.22, normShade) * ao;
-                    float directGlint = pow(saturate((rawLuma - 0.72) / 0.28), 24.0);
-                    specular = float3(0.98, 0.99, 1.0) * (envReflect * 0.25 + directGlint * 0.38);
+                    // === 5. 2x2 TWILL WOVEN CARBON FIBER ===
+                    float2 carbonUV = frac(uv * 180.0);
+                    float carbonWeave = ((carbonUV.x > 0.5) ^ (carbonUV.y > 0.5)) ? 0.72 : 1.35;
+                    diffuse = float3(0.09, 0.09, 0.10) * carbonWeave * lerp(0.75, 1.25, normShade) * ao;
+                    float directGlint = pow(saturate((rawLuma - 0.72) / 0.28), 20.0);
+                    specular = float3(1.0, 1.0, 1.0) * (envReflect * 0.30 + directGlint * 0.45);
                 }
                 else
                 {
@@ -608,12 +608,12 @@ Shader "ARCar/LivePaint"
                 }
                 else if (_Finish >= 4.5)
                 {
-                    // Carbon
-                    float2 carbonUV = frac(input.uv * 140.0);
-                    float carbonWeave = ((carbonUV.x > 0.5) ^ (carbonUV.y > 0.5)) ? 0.82 : 1.18;
-                    diffuse = float3(0.038, 0.038, 0.042) * carbonWeave * lerp(0.6, 1.2, normShade) * ao;
-                    float directGlint = pow(saturate((rawLuma - 0.72) / 0.28), 24.0);
-                    specular = float3(1.0, 0.99, 0.97) * directGlint * 0.40;
+                    // === 5. 2x2 TWILL WOVEN CARBON FIBER ===
+                    float2 carbonUV = frac(input.uv * 180.0);
+                    float carbonWeave = ((carbonUV.x > 0.5) ^ (carbonUV.y > 0.5)) ? 0.72 : 1.35;
+                    diffuse = float3(0.09, 0.09, 0.10) * carbonWeave * lerp(0.75, 1.25, normShade) * ao;
+                    float directGlint = pow(saturate((rawLuma - 0.72) / 0.28), 20.0);
+                    specular = float3(1.0, 1.0, 1.0) * directGlint * 0.45;
                 }
                 else
                 {

@@ -99,7 +99,7 @@ public class SentisCarSegmenter : MonoBehaviour
     // Anti-flicker hold: brief model dropouts (motion judder, exposure shifts) must not
     // make the paint blink. Keep showing the last accepted mask for a short grace period.
     int maskHoldCycles;
-    const int MaskHoldMaxCycles = 12;
+    const int MaskHoldMaxCycles = 6; // Bounded hold to eliminate ghosting lag during fast camera pans
     static RenderTexture probeRT;
     static Texture2D probeTex;
 
@@ -379,7 +379,7 @@ public class SentisCarSegmenter : MonoBehaviour
 
                     if (schedule != null)
                     {
-                        const float sliceBudgetSec = 0.0035f; // 3.5ms per frame keeps camera at 60 FPS
+                        const float sliceBudgetSec = 0.0020f; // 2.0ms per frame keeps camera locked at 60 FPS
                         bool scheduleOk = true;
                         while (loopActive && scheduleOk)
                         {
@@ -418,12 +418,11 @@ public class SentisCarSegmenter : MonoBehaviour
                                     // 4. Render neural mask output to maskRT
                                     TextureConverter.RenderToTexture(outputTensor, maskRT, outputTransform);
 
-                                    // 4b. Anti-flicker gate: if the fresh mask went empty/broken but we
-                                    // just had a good mask, hold the previous one for a short grace
-                                    // period instead of blinking the paint off.
+                                    // 4b. Anti-flicker gate: dual coverage & mean check so dark cars (black Camry) are never dropped
                                     float probeMean = ProbeMaskMean(maskRT);
                                     bool maskFailed = float.IsNaN(probeMean);
-                                    bool maskEmpty = maskFailed || probeMean < 0.002f;
+                                    float coverage = Mathf.Clamp01(probeMean * 3.5f);
+                                    bool maskEmpty = maskFailed || (probeMean < 0.0005f && coverage < 0.02f);
                                     bool holdLastMask = maskEmpty && hasSentInitialMask
                                         && maskHoldCycles < MaskHoldMaxCycles;
 

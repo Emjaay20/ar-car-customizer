@@ -166,10 +166,10 @@ class VehiclePaintMaskWrapper(nn.Module):
         parts_paint = torch.maximum(paint_low, paint_upper)
 
         max_paint_score = best_part_scores_k4[self.core_paint_indices, 0].max()
-        parts_presence = torch.clamp((max_paint_score - 0.32) * 8.0, 0.0, 1.0)
+        parts_presence = torch.clamp((max_paint_score - 0.20) * 8.0, 0.0, 1.0)
         car_presence = torch.maximum(veh_presence, parts_presence)
 
-        # 2b. Side mirrors: paint only the bright outer housing cap, never the dark reflective mirror glass
+        # 2b. Side mirrors: paint outer housing
         mirror_paint = self._eval_anchors_batched(
             parts_main,
             parts_proto_flat,
@@ -182,7 +182,7 @@ class VehiclePaintMaskWrapper(nn.Module):
         )
         parts_paint = torch.maximum(parts_paint, mirror_paint * mirror_cap_gate)
 
-        # 2c. Multi-Anchor Protected Cutouts (k=4 captures both inner & outer pieces of split Corolla taillights!)
+        # 2c. Multi-Anchor Protected Cutouts (k=4 captures both inner & outer pieces of split taillights)
         win_raw = self._eval_anchors_batched(
             parts_main,
             parts_proto_flat,
@@ -198,8 +198,8 @@ class VehiclePaintMaskWrapper(nn.Module):
             best_part_idx_k4[self.wheel_indices].reshape(-1),
             best_part_scores_k4[self.wheel_indices].reshape(-1),
             coeff_start=37,
-            score_thresh=0.13,
-            logit_thresh=0.12,
+            score_thresh=0.12,
+            logit_thresh=0.10,
         )
         grille_raw = self._eval_anchors_batched(
             parts_main,
@@ -208,7 +208,7 @@ class VehiclePaintMaskWrapper(nn.Module):
             best_part_scores_k4[[3]].reshape(-1),
             coeff_start=37,
             score_thresh=0.18,
-            logit_thresh=0.14,
+            logit_thresh=0.12,
         )
         lamps_plate_raw = self._eval_anchors_batched(
             parts_main,
@@ -216,58 +216,42 @@ class VehiclePaintMaskWrapper(nn.Module):
             best_part_idx_k4[[12, 16, 17, 25, 29]].reshape(-1),
             best_part_scores_k4[[12, 16, 17, 25, 29]].reshape(-1),
             coeff_start=37,
-            score_thresh=0.20,
-            logit_thresh=0.14,
+            score_thresh=0.18,
+            logit_thresh=0.12,
         )
 
-        # Tucked Vinyl Boundary Physics at 96x96:
-        # 1) Pull bloated 96x96 window & wheel halos off adjacent bright white sheet metal (luma_96 > 0.72)
-        bright_metal_gate = torch.clamp((luma_96 - 0.72) * 12.0, 0.0, 1.0)
-        win_eroded = 1.0 - F.max_pool2d(1.0 - win_raw, kernel_size=3, stride=1, padding=1)
-        win_tucked = win_raw * (1.0 - bright_metal_gate) + win_eroded * bright_metal_gate
+        # Tucked Vinyl Boundary Physics at 96x96 (Paint-Agnostic, no luminance suppression of dark sheet metal)
+        # 1) Tight window sealing (narrow 7x7 local boundary, never 45x45 screen-wide dilation)
+        win_frame_zone = F.max_pool2d(win_raw, kernel_size=7, stride=1, padding=3)
+        win_sealed = torch.maximum(win_raw, win_frame_zone * 0.85)
 
-        wheel_eroded = 1.0 - F.max_pool2d(1.0 - wheel_raw, kernel_size=5, stride=1, padding=2)
-        wheel_tucked = wheel_raw * (1.0 - bright_metal_gate) + wheel_eroded * bright_metal_gate
+        other_tucked = torch.maximum(grille_raw, lamps_plate_raw)
+        cutout = torch.maximum(torch.maximum(win_sealed, wheel_raw), other_tucked)
 
-        # Grille cutout applies strictly to dark grille mesh/emblem cavity (luma_96 < 0.52), never white bumper bridge
-        grille_dark_gate = torch.clamp((0.52 - luma_96) * 8.0, 0.0, 1.0)
-        grille_tucked = grille_raw * grille_dark_gate
-
-        lamps_eroded = 1.0 - F.max_pool2d(1.0 - lamps_plate_raw, kernel_size=3, stride=1, padding=1)
-        lamps_tucked = lamps_plate_raw * (1.0 - bright_metal_gate) + lamps_eroded * bright_metal_gate
-        other_tucked = torch.maximum(grille_tucked, lamps_tucked)
-
-        # 2) Seal the matte-black B-pillar & rubber window trim around windows (luma_96 < 0.46)
-        dark_trim_gate = torch.clamp((0.46 - luma_96) * 10.0, 0.0, 1.0)
-        win_frame_zone = F.max_pool2d(win_tucked, kernel_size=45, stride=1, padding=22)
-        win_sealed = torch.maximum(win_tucked, win_frame_zone * dark_trim_gate)
-
-        cutout = torch.maximum(torch.maximum(win_sealed, wheel_tucked), other_tucked)
-
-        # 3. Morphological C-Pillar & Panel Seam Bridge (closes gap between roof & quarter-panel, and hood & bumper nose)
-        # Never bridge into the top 10% sky/brick border above the roof (gy < 44 in 384px space)
+        # 2) Morphological seam bridging (below roof crown)
         below_roof_crown = torch.clamp((self.gy - 44.0) * 0.10, 0.0, 1.0)
-        pillar_metal_gate = torch.clamp((luma_96 - 0.46) * 8.0, 0.0, 1.0) * below_roof_crown
         closed_parts = 1.0 - F.max_pool2d(
-            1.0 - F.max_pool2d(parts_paint, kernel_size=17, stride=1, padding=8),
-            kernel_size=17,
+            1.0 - F.max_pool2d(parts_paint, kernel_size=9, stride=1, padding=4),
+            kernel_size=9,
             stride=1,
-            padding=8,
+            padding=4,
         )
-        bridged_parts = (parts_paint * (1.0 - dark_trim_gate * win_frame_zone))
-        bridged_parts = torch.maximum(bridged_parts, closed_parts * pillar_metal_gate)
+        bridged_parts = torch.maximum(parts_paint, closed_parts * below_roof_crown)
 
-        # Eroded silhouette interior assist anchored by detected panels OR windows (bridges door skin below window & nose above emblem)
+        # 3) Silhouette interior assist when vehicle envelope is present
         sil_eroded = 1.0 - F.max_pool2d(1.0 - car_silhouette, kernel_size=5, stride=1, padding=2)
         car_structure = torch.maximum(parts_paint, win_raw)
-        structure_halo = F.max_pool2d(car_structure, kernel_size=35, stride=1, padding=17)
-        sil_assist = sil_eroded * torch.clamp(structure_halo * 1.15, 0.0, 0.90) * pillar_metal_gate
+        structure_halo = F.max_pool2d(car_structure, kernel_size=25, stride=1, padding=12)
+        sil_assist = sil_eroded * torch.clamp(structure_halo * 1.15, 0.0, 0.90) * below_roof_crown
         body = torch.maximum(bridged_parts, sil_assist)
 
-        # Strict priority for protected cutouts (windows, split taillights, headlights, grille, wheels, plate)
-        clean_body = torch.clamp(body - cutout * 1.45, 0.0, 1.0)
+        # 4) Ground plane rejection: zero out below wheel/ground contact line (gy > 350 in 384px space)
+        ground_gate = torch.clamp((350.0 - self.gy) * 0.05, 0.0, 1.0)
 
-        # 4. In-Graph 384x384 Fast Edge-Guided Filter (dissolves 96x96 staircase steps & snaps to panel/glass borders)
+        # Strict priority for protected cutouts (windows, split taillights, headlights, grille, wheels, plate)
+        clean_body = torch.clamp(body - cutout * 1.45, 0.0, 1.0) * ground_gate
+
+        # 5. In-Graph 384x384 Fast Edge-Guided Filter
         smooth_96 = F.avg_pool2d(clean_body, kernel_size=3, stride=1, padding=1)
         p = F.interpolate(smooth_96, size=(384, 384), mode="bilinear", align_corners=False)
         I = luma_384
@@ -286,7 +270,7 @@ class VehiclePaintMaskWrapper(nn.Module):
         mean_b = F.avg_pool2d(b, kernel_size=9, stride=1, padding=4)
         guided_384 = torch.clamp(mean_a * I + mean_b, 0.0, 1.0)
 
-        sharp_metal = torch.clamp((guided_384 - 0.24) / 0.34, 0.0, 1.0) * 1.25
+        sharp_metal = torch.clamp((guided_384 - 0.08) / 0.42, 0.0, 1.0)
 
         final_mask = torch.clamp(sharp_metal, 0.0, 1.0) * car_presence
         return torch.clamp(final_mask, 0.0, 1.0)

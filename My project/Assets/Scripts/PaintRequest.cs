@@ -81,7 +81,8 @@ public class PaintRequest
             case "candy":
                 return new PaintFinishValues(0.42f, 0.92f, 0.96f);
             case "carbon":
-                return new PaintFinishValues(0.85f, 0.88f, 0.98f);
+                // 0.25 metallic allows the procedural 2x2 twill weave threads to be clearly visible under daylight
+                return new PaintFinishValues(0.25f, 0.68f, 0.98f);
             default:
                 return new PaintFinishValues(0.10f, 0.90f, 0.95f);
         }

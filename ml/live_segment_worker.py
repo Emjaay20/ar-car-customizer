@@ -827,6 +827,12 @@ def studio_polish_car_paint(
         clearcoat_f0 = 0.04
         clearcoat_grazing = 0.38
         spec_power = 48.0
+    elif finish == "carbon":
+        ambient_floor = 0.50
+        direct_scale = 0.50
+        clearcoat_f0 = 0.04
+        clearcoat_grazing = 0.30
+        spec_power = 24.0
     else:
         # Showroom Gloss
         ambient_floor = 0.56
@@ -856,8 +862,14 @@ def studio_polish_car_paint(
     is_neutral = (paint_hsv[1] < 25.0) or (abs(float(target_bgr[0]) - float(target_bgr[1])) < 0.06 and abs(float(target_bgr[1]) - float(target_bgr[2])) < 0.06)
 
     if is_neutral:
-        # True Neutral Paint (Matte Black, Metallic Silver, Pure White, Charcoal):
-        if finish == "matte":
+        # True Neutral Paint (Matte Black, Metallic Silver, Pure White, Charcoal, Carbon):
+        if finish == "carbon":
+            gy, gx = np.ogrid[:h, :w]
+            cu_x = (gx * (180.0 / float(w))) % 1.0
+            cu_y = (gy * (180.0 / float(h))) % 1.0
+            weave = np.where((cu_x > 0.5) ^ (cu_y > 0.5), 0.72, 1.35)[:, :, None]
+            effective_albedo = np.array([0.09, 0.09, 0.10], dtype=np.float32) * weave * np.clip(0.75 + 0.50 * norm_shade, 0.50, 1.30)[:, :, None]
+        elif finish == "matte":
             norm_shade = np.clip((smooth_luma - p5) / max(p95 - p5, 0.15), 0.0, 1.0)
             if target_luma < 0.12:
                 # Realistic 3D Automotive Matte Black (e.g. 3M 2080 Deep Matte Black)
@@ -879,9 +891,13 @@ def studio_polish_car_paint(
                 effective_albedo = target_bgr[None, None, :] * surface_illum
     else:
         # Non-neutral Colored Pigments (Candy Red, Velocity Red, Marina Blue, etc.)
-        # Base pigment illumination is derived strictly from normalized intrinsic shading (norm_shade),
-        # NEVER from raw camera luma (frame_hsv[:, :, 2] * luma_scale) which causes the dark-on-dark paint bug!
-        if finish == "matte":
+        if finish == "carbon":
+            gy, gx = np.ogrid[:h, :w]
+            cu_x = (gx * (180.0 / float(w))) % 1.0
+            cu_y = (gy * (180.0 / float(h))) % 1.0
+            weave = np.where((cu_x > 0.5) ^ (cu_y > 0.5), 0.72, 1.35)[:, :, None]
+            effective_albedo = np.array([0.09, 0.09, 0.10], dtype=np.float32) * weave * np.clip(0.75 + 0.50 * norm_shade, 0.50, 1.30)[:, :, None]
+        elif finish == "matte":
             # 100% Solid Velvet Automotive Basecoat (e.g. Carmine Red)
             surface_illum = np.clip(ambient_floor + direct_scale * norm_shade, 0.55, 1.15)[:, :, None]
             effective_albedo = target_bgr[None, None, :] * surface_illum
@@ -1092,11 +1108,22 @@ def process_frame(
     intrinsic_mask_bgr = encode_intrinsic_mask_bgr(work_bgr, paint_u8, plate_bool)
 
     paint_pixels = int(np.count_nonzero(paint_u8 > 64))
-    if hd_mode and (paint_pixels < 400 or (paint_pixels / float(work_w * work_h)) < 0.0015):
-        return {
-            "ok": False,
-            "reason": "Could not isolate car sheet metal cleanly. Please point camera directly at the car and try again.",
-        }
+    if hd_mode and (paint_pixels < 200 and (paint_pixels / float(work_w * work_h)) < 0.0005):
+        if solid_silhouette is not None and np.count_nonzero(solid_silhouette) > 0:
+            paint_u8 = cv2.resize(solid_silhouette, (work_w, work_h))
+        else:
+            paint_u8 = np.maximum(paint_u8, (mask_u8 > 32).astype(np.uint8) * 255)
+        # Re-polish with fallback mask so HD cut never fails with toast
+        polished_bgr = studio_polish_car_paint(
+            work_bgr,
+            paint_u8,
+            hex_color=hex_color,
+            finish=finish,
+            panel=panel,
+            license_plate=plate_bool,
+            solid_silhouette=solid_silhouette,
+        )
+        intrinsic_mask_bgr = encode_intrinsic_mask_bgr(work_bgr, paint_u8, plate_bool)
 
 
     ok_enc, png_buf = cv2.imencode(".png", intrinsic_mask_bgr)
