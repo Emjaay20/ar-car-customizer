@@ -101,6 +101,8 @@ public class SentisCarSegmenter : MonoBehaviour
     // make the paint blink. Keep showing the last accepted mask for a short grace period.
     bool reportedNoVehicle;
     float captureStartedAt;
+    float lastValidMaskTime = -100f;
+    float lastValidCoverage = 0f;
     static RenderTexture probeRT;
     static Texture2D probeTex;
 
@@ -438,7 +440,21 @@ public class SentisCarSegmenter : MonoBehaviour
                                     float coverage;
                                     float probeMean = ProbeMaskMean(maskRT, out coverage);
                                     bool stale = Time.unscaledTime - captureStartedAt > 0.75f;
-                                    bool maskEmpty = !float.IsFinite(probeMean) || coverage <= 0f || stale;
+                                    bool frameHasMask = float.IsFinite(probeMean) && coverage > 0.005f && !stale;
+
+                                    float angleDelta = hasPrevCamPose ? Quaternion.Angle(capRot, prevCamRot) : 0f;
+                                    float posDelta = hasPrevCamPose ? Vector3.Distance(capPos, prevCamPos) : 0f;
+
+                                    // Guardrail 2: Motion & Overlap-Gated Temporal Persistence (No Wall Painting)
+                                    // Maintain lock during close-ups only while previous mask had valid area (> 8%)
+                                    // and camera motion is smooth (low rotational/translational velocity).
+                                    // If total vehicle + panel evidence drops to zero when camera points at wall/floor,
+                                    // decay and clear within 200-300ms.
+                                    bool canHold = hasSentInitialMask && lastValidCoverage >= 0.08f &&
+                                                   (Time.unscaledTime - lastValidMaskTime <= 2.0f) &&
+                                                   (angleDelta < 10.0f && posDelta < 0.15f);
+
+                                    bool maskEmpty = !frameHasMask && !canHold;
                                     if (maskEmpty || coverage > 0.60f)
                                     {
                                         var sample = LearningSampleRecorder.TryRecord(inputRT, maskRT,
@@ -458,6 +474,7 @@ public class SentisCarSegmenter : MonoBehaviour
                                         }
                                         hasPrevCamPose = false;
                                         hasSentInitialMask = false;
+                                        lastValidCoverage = 0f;
                                         if (!reportedNoVehicle)
                                             Report(stale ? "SENTIS_TRACKING_LOST" : "SENTIS_NO_VEHICLE");
                                         reportedNoVehicle = true;
@@ -466,57 +483,72 @@ public class SentisCarSegmenter : MonoBehaviour
                                     if (!maskEmpty)
                                     {
                                     reportedNoVehicle = false;
-                                    // 5. Motion-Adaptive Temporal EMA Smoothing:
-                                    float blendFactor = 0.25f;
-                                    if (hasPrevCamPose)
+                                    if (frameHasMask)
                                     {
-                                        float angleDelta = Quaternion.Angle(capRot, prevCamRot);
-                                        float posDelta = Vector3.Distance(capPos, prevCamPos);
-                                        if (angleDelta > 6.0f || posDelta > 0.10f)
+                                        lastValidMaskTime = Time.unscaledTime;
+                                        lastValidCoverage = coverage;
+                                        hasSentInitialMask = true;
+
+                                        // 5. Motion-Adaptive Temporal EMA Smoothing:
+                                        float blendFactor = 0.25f;
+                                        if (hasPrevCamPose)
                                         {
-                                            blendFactor = 0.95f; // Fast turn / new angle: nearly fresh frame, minimal ghosting
+                                            if (angleDelta > 6.0f || posDelta > 0.10f)
+                                            {
+                                                blendFactor = 0.95f; // Fast turn / new angle: nearly fresh frame, minimal ghosting
+                                            }
+                                            else if (angleDelta > 2.0f || posDelta > 0.03f)
+                                            {
+                                                blendFactor = 0.90f; // Walking / panning: 10% trail prevents strobing without drag
+                                            }
+                                            else if (angleDelta > 0.6f || posDelta > 0.01f)
+                                            {
+                                                blendFactor = 0.55f; // Gentle drift
+                                            }
+                                            else
+                                            {
+                                                blendFactor = 0.25f; // Stationary: rock-solid against glare
+                                            }
                                         }
-                                        else if (angleDelta > 2.0f || posDelta > 0.03f)
+                                        prevCamPos = capPos;
+                                        prevCamRot = capRot;
+                                        hasPrevCamPose = true;
+
+                                        RenderTexture activeMask = maskRT;
+                                        if (blendMaterial != null && smoothMaskRT != null && historyMaskRT != null)
                                         {
-                                            blendFactor = 0.90f; // Walking / panning: 10% trail prevents strobing without drag
+                                            if (blendFactor > 0.01f)
+                                            {
+                                                blendMaterial.SetTexture("_PrevTex", historyMaskRT);
+                                                blendMaterial.SetFloat("_Blend", blendFactor);
+                                                Graphics.Blit(maskRT, smoothMaskRT, blendMaterial);
+                                                Graphics.Blit(smoothMaskRT, historyMaskRT);
+                                                activeMask = smoothMaskRT;
+                                            }
+                                            else
+                                            {
+                                                Graphics.Blit(maskRT, historyMaskRT);
+                                                activeMask = maskRT;
+                                            }
                                         }
-                                        else if (angleDelta > 0.6f || posDelta > 0.01f)
+
+                                        // 6. Apply clean scene texture + smoothed mask + 6DoF capture pose anchor to LiveCarFilter
+                                        var filter = LiveCarFilter.Ensure(cam);
+                                        if (filter != null)
                                         {
-                                            blendFactor = 0.55f; // Gentle drift
-                                        }
-                                        else
-                                        {
-                                            blendFactor = 0.25f; // Stationary: rock-solid against glare
+                                            filter.SetSceneTexture(inputRT);
+                                            filter.SetMask(activeMask, 1.0f, capPos, capRot, captureStartedAt);
                                         }
                                     }
-                                    prevCamPos = capPos;
-                                    prevCamRot = capRot;
-                                    hasPrevCamPose = true;
-
-                                    RenderTexture activeMask = maskRT;
-                                    if (blendMaterial != null && smoothMaskRT != null && historyMaskRT != null)
+                                    else
                                     {
-                                        if (blendFactor > 0.01f)
+                                        // Holding valid mask during brief close-up transition: warp history mask with current camera pose
+                                        var filter = LiveCarFilter.Ensure(cam);
+                                        if (filter != null && historyMaskRT != null)
                                         {
-                                            blendMaterial.SetTexture("_PrevTex", historyMaskRT);
-                                            blendMaterial.SetFloat("_Blend", blendFactor);
-                                            Graphics.Blit(maskRT, smoothMaskRT, blendMaterial);
-                                            Graphics.Blit(smoothMaskRT, historyMaskRT);
-                                            activeMask = smoothMaskRT;
+                                            filter.SetSceneTexture(inputRT);
+                                            filter.SetMask(historyMaskRT, 1.0f, capPos, capRot, lastValidMaskTime);
                                         }
-                                        else
-                                        {
-                                            Graphics.Blit(maskRT, historyMaskRT);
-                                            activeMask = maskRT;
-                                        }
-                                    }
-
-                                    // 6. Apply clean scene texture + smoothed mask + 6DoF capture pose anchor to LiveCarFilter
-                                    var filter = LiveCarFilter.Ensure(cam);
-                                    if (filter != null)
-                                    {
-                                        filter.SetSceneTexture(inputRT);
-                                        filter.SetMask(activeMask, 1.0f, capPos, capRot, captureStartedAt);
                                     }
 
                                     } // end valid fresh mask

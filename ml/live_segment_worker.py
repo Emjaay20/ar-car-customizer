@@ -370,9 +370,14 @@ def build_paint_mask(
     gray_u8 = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     gray = gray_u8.astype(np.float32) / 255.0
 
+    car_pixels = gray_u8[solid > 0]
+    car_median = float(np.median(car_pixels)) if len(car_pixels) > 0 else 100.0
+    is_light_car = car_median > 115.0
+
     # Run neural parts segmentation model on the frame
     parts_model = get_parts_model()
     cutout = np.zeros((h, w), dtype=np.uint8)
+    raw_cutouts = np.zeros((h, w), dtype=np.uint8)
     body_panels_union = np.zeros((h, w), dtype=np.uint8)
     lamp_support = np.zeros((h, w), dtype=np.uint8)
     license_plate = np.zeros((h, w), dtype=bool)
@@ -390,8 +395,21 @@ def build_paint_mask(
                 if ('headlight' in part_name or 'tail-light' in part_name) and conf >= 0.20:
                     lamp_support = cv2.bitwise_or(lamp_support, m_u8)
 
+                # Track raw non-paint cutouts before any dilation or heuristic expansion
+                if part_name in NON_PAINT_PARTS and part_name != 'license-plate':
+                    raw_cutouts = cv2.bitwise_or(raw_cutouts, m_u8)
+
                 # 1. Body Panel Union: add detected trunk, hood, doors, roof, bumpers, fenders to solid
                 if part_name in PAINTABLE_BODY_PARTS and conf >= 0.10:
+                    if part_name == 'hood':
+                        # Fill specular sky reflection gaps on dark hood
+                        c_hood, h_hood = cv2.findContours(m_u8.copy(), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+                        if c_hood and h_hood is not None:
+                            for hi, hinfo in enumerate(h_hood[0]):
+                                if hinfo[3] != -1:
+                                    cv2.drawContours(m_u8, c_hood, hi, 255, -1)
+                        k_hood = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                        m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_CLOSE, k_hood)
                     body_panels_union = cv2.bitwise_or(body_panels_union, m_u8)
                 elif 'mirror' in part_name and conf >= 0.10:
                     # Paint the outer mirror cap while excluding dark reflective mirror glass
@@ -399,6 +417,7 @@ def build_paint_mask(
                     mirror_glass = (m_u8 > 0) & (gray_u8 < 72)
                     body_panels_union = cv2.bitwise_or(body_panels_union, mirror_cap.astype(np.uint8) * 255)
                     cutout = cv2.bitwise_or(cutout, mirror_glass.astype(np.uint8) * 255)
+                    raw_cutouts = cv2.bitwise_or(raw_cutouts, mirror_glass.astype(np.uint8) * 255)
 
                 # 2. Exclude non-paint regions:
                 if full_coverage:
@@ -421,11 +440,12 @@ def build_paint_mask(
                             k_win_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
                             win_core = cv2.erode(win_u8, k_win_erode, iterations=1)
                             win_u8[(gray_u8 > 175) & (win_core == 0)] = 0
-                            # Seal adjacent matte-black B-pillar and black rubber window molding into the cabin cutout
-                            k_b_pillar = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
-                            win_zone = cv2.dilate(win_u8, k_b_pillar, iterations=1)
-                            b_pillar_trim = (win_zone > 0) & (gray_u8 < 72) & (solid > 0)
-                            win_u8[b_pillar_trim] = 255
+                            # Seal adjacent matte-black B-pillar strictly on light cars; never eat dark car sheet metal!
+                            if is_light_car:
+                                k_b_pillar = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+                                win_zone = cv2.dilate(win_u8, k_b_pillar, iterations=1)
+                                b_pillar_trim = (win_zone > 0) & (gray_u8 < 55) & (solid > 0) & (body_panels_union == 0)
+                                win_u8[b_pillar_trim] = 255
                             cutout = cv2.bitwise_or(cutout, win_u8)
                         elif 'wheel' in part_name:
                             # Pull wheel mask border off bright white painted fender arch lips (gray_u8 > 168)
@@ -446,6 +466,7 @@ def build_paint_mask(
 
                 if part_name == 'license-plate' and conf >= 0.35:
                     license_plate = license_plate | (m_u8 > 0)
+                    raw_cutouts = cv2.bitwise_or(raw_cutouts, (m_u8 > 0).astype(np.uint8) * 255)
 
                 # Panel gating support (body, hood, roof, doors)
                 if panel_selected_mask is not None:
@@ -456,8 +477,13 @@ def build_paint_mask(
                     elif panel == "doors" and "door" in part_name:
                         panel_selected_mask = cv2.bitwise_or(panel_selected_mask, m_u8)
 
-    # Union detected body panels with solid car silhouette so missing trunk/doors are fully covered
+    # Panel-scoped topological closure strictly on sheet-metal panel masks (hood, doors, fenders, bumpers)
     if np.any(body_panels_union > 0):
+        c_panels, h_panels = cv2.findContours(body_panels_union.copy(), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if c_panels and h_panels is not None:
+            for pi, pinfo in enumerate(h_panels[0]):
+                if pinfo[3] != -1:
+                    cv2.drawContours(body_panels_union, c_panels, pi, 255, -1)
         solid = cv2.bitwise_or(solid, body_panels_union)
 
     # Step B: Morphological closing & convex hole healing on car body FIRST (before cutout subtraction)
@@ -477,6 +503,9 @@ def build_paint_mask(
                 hole_area = cv2.contourArea(contours[i])
                 if hole_area < max(250, int(0.045 * total_car_area)):
                     cv2.drawContours(solid, contours, i, 255, -1)
+
+    # Guardrail 1: Re-assert raw cutouts after closure so convex closure NEVER bridges across windshield or wheel wells
+    solid[raw_cutouts > 0] = 0
 
     if not full_coverage:
         # Red paint must never be excluded solely because it resembles red plastic.
@@ -524,7 +553,10 @@ def build_paint_mask(
     # Tightened threshold (0.35 / 0.30) eliminates the 10-30px bleed beyond roof and sills
     paint_f = base_paint.astype(np.float32) / 255.0
     guided = guided_filter_mask(gray, paint_f, radius=3, eps=1e-3)
-    sharp_alpha = np.clip((guided - 0.35) / 0.30, 0.0, 1.0)
+    if is_light_car:
+        sharp_alpha = np.clip((guided - 0.28) / 0.32, 0.0, 1.0)
+    else:
+        sharp_alpha = np.clip((guided - 0.12) / 0.35, 0.0, 1.0)
     solid_f = (solid > 0).astype(np.float32)
     sharp_alpha = np.minimum(sharp_alpha, cv2.GaussianBlur(solid_f, (3, 3), 0))
     sharp_alpha[solid == 0] = 0.0

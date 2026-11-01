@@ -16,7 +16,8 @@ class MaskSafetyTests(unittest.TestCase):
         self.assertFalse(has_exterior_evidence(result,{0:'right_front-wheel'},silhouette))
         result.masks.data=torch.tensor(np.flip(outside,axis=2).copy())
         self.assertTrue(has_exterior_evidence(result,{0:'right_front-wheel'},silhouette))
-        self.assertFalse(has_exterior_evidence(result,{0:'hood'},silhouette))
+        self.assertTrue(has_exterior_evidence(result,{0:'hood'},silhouette))
+        self.assertFalse(has_exterior_evidence(result,{0:'person'},silhouette))
 
     def test_red_body_is_not_a_taillight(self):
         frame=np.zeros((100,100,3),np.uint8);frame[:]=[20,20,180]

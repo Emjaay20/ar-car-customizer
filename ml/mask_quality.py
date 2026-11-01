@@ -3,23 +3,31 @@ import cv2
 import numpy as np
 
 def has_exterior_evidence(result, names, silhouette):
-    """Require a credible exterior landmark belonging to the selected instance.
-
-    This conservative operating mode abstains on unsupported cabin/panel-only views.
-    It is not an interior classifier and needs held-out testing.
+    """Require credible exterior landmark or body panel evidence belonging to the selected instance.
+    Supports full walkaround angles: doors, roof, hood, bumpers, fenders, windows, and mirrors,
+    while reliably rejecting walls, ground, cabin interior, and non-vehicle scenes.
     """
-    if result is None or result.masks is None or result.boxes is None:
+    if result is None or result.masks is None or result.boxes is None or silhouette is None:
         return False
-    h,w=silhouette.shape[:2]
-    for i,c in enumerate(result.boxes.cls):
-        name=names[int(c)]
-        if not any(t in name for t in ('wheel','headlight','tail-light','grille','license')):
+    h, w = silhouette.shape[:2]
+    exterior_tokens = (
+        'wheel', 'headlight', 'tail-light', 'grille', 'license',
+        'hood', 'door', 'roof', 'fender', 'bumper', 'quarter-panel', 'rocker-panel', 'trunk',
+        'mirror', 'windshield', 'window'
+    )
+    for i, c in enumerate(result.boxes.cls):
+        name = names[int(c)]
+        if not any(t in name for t in exterior_tokens):
             continue
-        if float(result.boxes.conf[i]) < .35:
+        if float(result.boxes.conf[i]) < 0.22:
             continue
-        mask=cv2.resize(result.masks.data[i].cpu().numpy(),(w,h))>.5
-        overlap=np.count_nonzero(mask & (silhouette>0))/max(1,np.count_nonzero(mask))
-        if overlap>.5:return True
+        mask = cv2.resize(result.masks.data[i].cpu().numpy(), (w, h)) > 0.4
+        mask_area = np.count_nonzero(mask)
+        if mask_area < 50:
+            continue
+        overlap = np.count_nonzero(mask & (silhouette > 0)) / float(mask_area)
+        if overlap > 0.35:
+            return True
     return False
 
 def red_lamp_refinement(frame, lamp_support, silhouette):

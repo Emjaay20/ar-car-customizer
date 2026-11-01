@@ -92,8 +92,13 @@ class VehiclePaintMaskWrapper(nn.Module):
             fg_gate = torch.clamp((y2 - 135.0) * 0.10, 0.0, 1.0)
             gate = gate * fg_gate
 
-        in_box_x = torch.clamp(self.gx - x1 + 0.5, 0.0, 1.0) * torch.clamp(x2 - self.gx + 0.5, 0.0, 1.0)
-        in_box_y = torch.clamp(self.gy - y1 + 0.5, 0.0, 1.0) * torch.clamp(y2 - self.gy + 0.5, 0.0, 1.0)
+        # Smooth border expansion: if anchor extends near the left or right screen border,
+        # extend to viewport edge so close-up walkarounds don't create razor-sharp vertical slices
+        adj_x1 = torch.where(x1 < 48.0, torch.zeros_like(x1) - 10.0, x1)
+        adj_x2 = torch.where(x2 > 336.0, torch.zeros_like(x2) + 394.0, x2)
+        adj_y1 = torch.where(y1 < 48.0, torch.zeros_like(y1) - 10.0, y1)
+        in_box_x = torch.clamp(self.gx - adj_x1 + 0.5, 0.0, 1.0) * torch.clamp(adj_x2 - self.gx + 0.5, 0.0, 1.0)
+        in_box_y = torch.clamp(self.gy - adj_y1 + 0.5, 0.0, 1.0) * torch.clamp(y2 - self.gy + 0.5, 0.0, 1.0)
         in_box = in_box_x * in_box_y  # [1, N, 96, 96]
 
         mc = anchor_cols[coeff_start : coeff_start + 32, :].transpose(0, 1).unsqueeze(0)  # [1, N, 32]
@@ -229,21 +234,20 @@ class VehiclePaintMaskWrapper(nn.Module):
         other_tucked = torch.maximum(grille_raw, lamps_plate_raw)
         cutout = torch.maximum(torch.maximum(win_sealed, wheel_raw), other_tucked)
 
-        # 2) Morphological seam bridging (below roof crown)
-        below_roof_crown = torch.clamp((self.gy - 44.0) * 0.10, 0.0, 1.0)
+        # 2) Morphological seam bridging (seamless across roof and pillars)
         closed_parts = 1.0 - F.max_pool2d(
             1.0 - F.max_pool2d(parts_paint, kernel_size=9, stride=1, padding=4),
             kernel_size=9,
             stride=1,
             padding=4,
         )
-        bridged_parts = torch.maximum(parts_paint, closed_parts * below_roof_crown)
+        bridged_parts = torch.maximum(parts_paint, closed_parts)
 
         # 3) Silhouette interior assist when vehicle envelope is present
         sil_eroded = 1.0 - F.max_pool2d(1.0 - car_silhouette, kernel_size=5, stride=1, padding=2)
         car_structure = torch.maximum(parts_paint, win_raw)
         structure_halo = F.max_pool2d(car_structure, kernel_size=25, stride=1, padding=12)
-        sil_assist = sil_eroded * torch.clamp(structure_halo * 1.15, 0.0, 0.90) * below_roof_crown
+        sil_assist = sil_eroded * torch.clamp(structure_halo * 1.15, 0.0, 0.90)
         body = torch.maximum(bridged_parts, sil_assist)
 
         # 4) Ground plane rejection: zero out below wheel/ground contact line (gy > 350 in 384px space)
@@ -296,7 +300,7 @@ class VehiclePaintMaskWrapper(nn.Module):
             # Conservative abstention on ambiguous cabin/unsupported views.
             # No colour or fixed screen-position rule authorizes background paint.
             accepted = torch.clamp((selected_conf - 0.35) * 20.0, 0.0, 1.0).view(1, 1, 1, 1)
-            exterior_classes = self.wheel_indices + [3, 12, 16, 17, 25, 29]
+            exterior_classes = self.wheel_indices + [3, 12, 16, 17, 25, 29] + self.core_paint_indices + self.mirror_indices + self.win_indices
             landmark_scores = best_part_scores_k4[exterior_classes, 0]
             landmark_indices = best_part_idx_k4[exterior_classes, 0]
             landmark_xy = parts_main[0:2, landmark_indices]
@@ -306,20 +310,23 @@ class VehiclePaintMaskWrapper(nn.Module):
                                  (selected_box[2:4] * 0.5 + 1e-4), 0.0, 1.0)
             spatial_support = torch.clamp(within.min(dim=0)[0] * 20.0, 0.0, 1.0)
             exterior_score = (landmark_scores * spatial_support).max()
-            exterior_gate = torch.clamp((exterior_score - 0.30) * 10.0, 0.0, 1.0)
+            exterior_gate = torch.clamp((exterior_score - 0.22) * 10.0, 0.0, 1.0)
             accepted = accepted * exterior_gate
             guarded_mask = final_mask * envelope * accepted
+
             # Side-window crops can show no wheel or lamp. A confidently detected
             # window + side mirror + vehicle is a separate, bounded parts mode.
             window_score = best_part_scores_k4[self.win_indices, 0].max()
             mirror_score = best_part_scores_k4[self.mirror_indices, 0].max()
-            side_gate = torch.clamp((window_score - 0.70) * 10.0, 0.0, 1.0) * torch.clamp((mirror_score - 0.60) * 10.0, 0.0, 1.0)
-            side_vehicle_gate = torch.clamp((selected_conf - 0.35) * 10.0, 0.0, 1.0).view(1,1,1,1)
-            # Whole-car detection weakens in tight front/rear crops. Permit a
-            # parts-only view only with two independent high-confidence physical
-            # exterior landmarks, and never grow beyond predicted body panels.
-            physical, _ = torch.topk(landmark_scores, k=2)
-            closeup_gate = torch.clamp((physical[1] - 0.50) * 10.0, 0.0, 1.0)
+            side_gate = torch.clamp((window_score - 0.45) * 8.0, 0.0, 1.0) * torch.clamp((mirror_score - 0.35) * 8.0, 0.0, 1.0)
+            side_vehicle_gate = torch.clamp((selected_conf - 0.25) * 8.0, 0.0, 1.0).view(1,1,1,1)
+
+            # Whole-car detection weakens in tight front/rear/door crops.
+            # Permit parts-only view when at least two physical exterior panels have high confidence
+            panel_scores = best_part_scores_k4[self.core_paint_indices, 0]
+            physical_scores = torch.cat([landmark_scores, panel_scores], dim=0)
+            physical, _ = torch.topk(physical_scores, k=2)
+            closeup_gate = torch.clamp((physical[1] - 0.30) * 8.0, 0.0, 1.0)
             weak_detector = torch.clamp((0.35 - selected_conf) * 20.0, 0.0, 1.0).view(1,1,1,1)
             panel_support = F.interpolate(parts_paint, size=(384,384), mode="bilinear", align_corners=False)
             closeup_mask = final_mask * torch.clamp(panel_support * 2.0, 0.0, 1.0) * closeup_gate * weak_detector
