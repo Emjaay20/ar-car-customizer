@@ -250,11 +250,8 @@ class VehiclePaintMaskWrapper(nn.Module):
         sil_assist = sil_eroded * torch.clamp(structure_halo * 1.15, 0.0, 0.90)
         body = torch.maximum(bridged_parts, sil_assist)
 
-        # 4) Ground plane rejection: zero out below wheel/ground contact line (gy > 350 in 384px space)
-        ground_gate = torch.clamp((350.0 - self.gy) * 0.05, 0.0, 1.0)
-
         # Strict priority for protected cutouts (windows, split taillights, headlights, grille, wheels, plate)
-        clean_body = torch.clamp(body - cutout * 1.45, 0.0, 1.0) * ground_gate
+        clean_body = torch.clamp(body - cutout * 1.45, 0.0, 1.0)
 
         # 5. In-Graph 384x384 Fast Edge-Guided Filter
         smooth_96 = F.avg_pool2d(clean_body, kernel_size=3, stride=1, padding=1, count_include_pad=not self.guarded)

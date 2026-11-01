@@ -1,0 +1,95 @@
+{
+  "cases": [
+    {
+      "case": "black-camry",
+      "coverage": 0.41418809904917386,
+      "parity_max_difference": 5.817413330078125e-05
+    },
+    {
+      "case": "blue-civic",
+      "coverage": 0.3038019269269269,
+      "parity_max_difference": 2.5570392608642578e-05
+    },
+    {
+      "case": "bmw-video-1.0",
+      "coverage": 0.21497721354166666,
+      "parity_max_difference": 2.8702430427074432e-05
+    },
+    {
+      "case": "bmw-video-11.05",
+      "coverage": 0.21345594618055555,
+      "parity_max_difference": 3.0994415283203125e-05
+    },
+    {
+      "case": "bmw-video-6.03",
+      "coverage": 0.21333658854166668,
+      "parity_max_difference": 2.4259090423583984e-05
+    },
+    {
+      "case": "convertible-video-1.0",
+      "coverage": 0.04307400173611111,
+      "parity_max_difference": 6.216764450073242e-05
+    },
+    {
+      "case": "convertible-video-13.67",
+      "coverage": 0.2359396701388889,
+      "parity_max_difference": 4.798173904418945e-05
+    },
+    {
+      "case": "convertible-video-7.33",
+      "coverage": 0.0,
+      "parity_max_difference": 0.0
+    },
+    {
+      "case": "negative-wall",
+      "coverage": 0.0,
+      "parity_max_difference": 0.0
+    },
+    {
+      "case": "red-tesla",
+      "coverage": 0.11470753601271835,
+      "parity_max_difference": 1.1086463928222656e-05
+    },
+    {
+      "case": "silver-suv",
+      "coverage": 0.34271990740740743,
+      "parity_max_difference": 3.0517578125e-05
+    }
+  ],
+  "sha256": "d93568ed14b23eec4db1b4941e1ec5f02ef1374666e7320ea9aec3511ac23a6f",
+  "operators": [
+    "Abs",
+    "Add",
+    "AveragePool",
+    "Clip",
+    "Concat",
+    "Constant",
+    "Conv",
+    "ConvTranspose",
+    "Div",
+    "Expand",
+    "Gather",
+    "Greater",
+    "Less",
+    "MatMul",
+    "Max",
+    "MaxPool",
+    "Mul",
+    "ReduceMax",
+    "ReduceMin",
+    "Reshape",
+    "Resize",
+    "Shape",
+    "Sigmoid",
+    "Slice",
+    "Softmax",
+    "Split",
+    "Sqrt",
+    "Sub",
+    "TopK",
+    "Transpose",
+    "Unsqueeze",
+    "Where"
+  ],
+  "note": "Postprocessing refinement; no pretrained weights were fine-tuned."
+}
